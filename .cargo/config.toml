@@ -1,0 +1,22 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "link-arg=-nostartfiles",
+]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+ESP_IDF_VERSION = { value = "v5.1" }
+# Set these environment variables or put them in .env
+# ORCHESTRATOR_URL = "wss://bentoproxy.com:8443/ws/device"
+# DEVICE_ID = "esp32-dev-001"
+# DEVICE_TOKEN = "your-secret-token"
+# WIFI_SSID = "YourWiFiSSID"
+# WIFI_PASSWORD = "YourWiFiPassword"
