@@ -1,0 +1,13 @@
+# Increase main task stack size to prevent overflow (TLS needs lots of stack)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# WiFi configuration
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+
+# Enable WiFi
+CONFIG_ESP_WIFI_ENABLED=y
+
+# Use single factory app partition but larger
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
