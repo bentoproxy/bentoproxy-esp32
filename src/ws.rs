@@ -1,0 +1,435 @@
+//! Minimal RFC 6455 client over an already-established byte stream.
+//!
+//! The socket is non-blocking, so bytes arrive in arbitrary chunks: a frame
+//! header can be split across reads. The previous version called read_exact()
+//! per frame, which consumed part of a header and then returned WouldBlock,
+//! dropping those bytes and desyncing the connection permanently. Everything
+//! here parses out of a persistent buffer instead, so a partial frame simply
+//! stays buffered until the rest arrives.
+
+use std::io::{Read, Write};
+
+use anyhow::{anyhow, Result};
+use bentoproxy_protocol::Frame;
+use log::{debug, info, warn};
+
+const OP_CONTINUATION: u8 = 0x0;
+const OP_BINARY: u8 = 0x2;
+const OP_CLOSE: u8 = 0x8;
+const OP_PING: u8 = 0x9;
+const OP_PONG: u8 = 0xA;
+
+/// Payload cap for a single message. The orchestrator never sends more, and
+/// without a limit a bad length prefix would try to allocate past free heap.
+const MAX_PAYLOAD: usize = 64 * 1024;
+
+/// A WebSocket client connection.
+pub struct WsConn<S> {
+    stream: S,
+    /// Bytes received but not yet consumed by a complete frame.
+    rx: Vec<u8>,
+    /// Payload of a fragmented message assembled so far.
+    fragment: Vec<u8>,
+    scratch: [u8; 1024],
+}
+
+impl<S: Read + Write> WsConn<S> {
+    /// Perform the opening handshake, then wrap the stream.
+    ///
+    /// The key is random per connection and the server's Sec-WebSocket-Accept
+    /// is verified, so a stray HTTP endpoint cannot be mistaken for a peer.
+    pub fn connect(mut stream: S, host: &str, path: &str) -> Result<Self> {
+        let key = random_key();
+
+        let request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             \r\n"
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+
+        // The handshake runs while the socket is still blocking, but a server
+        // may still split the response, so read until the header terminator.
+        let mut response = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                return Err(anyhow!("connection closed during handshake"));
+            }
+            response.extend_from_slice(&buf[..n]);
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if response.len() > 4096 {
+                return Err(anyhow!("handshake response too large"));
+            }
+        }
+
+        let text = String::from_utf8_lossy(&response);
+        if !text.contains("101 Switching Protocols") {
+            return Err(anyhow!("handshake rejected: {}", text.lines().next().unwrap_or("")));
+        }
+
+        let expected = accept_key(&key);
+        let accepted = text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("sec-websocket-accept")
+                    .then(|| value.trim().to_string())
+            })
+            .ok_or_else(|| anyhow!("handshake response has no Sec-WebSocket-Accept"))?;
+
+        if accepted != expected {
+            return Err(anyhow!("handshake key mismatch: peer is not a WebSocket server"));
+        }
+
+        info!("WebSocket handshake complete");
+        Ok(Self {
+            stream,
+            rx: Vec::with_capacity(2048),
+            fragment: Vec::new(),
+            scratch: [0u8; 1024],
+        })
+    }
+
+    /// Read whatever is available and return a frame once one is complete.
+    ///
+    /// `Ok(None)` means "nothing complete yet" — the normal case on a
+    /// non-blocking socket — and never loses buffered bytes.
+    pub fn poll_frame(&mut self) -> Result<Option<Frame>> {
+        self.fill()?;
+
+        loop {
+            match self.take_message()? {
+                Some((OP_BINARY, payload)) | Some((OP_CONTINUATION, payload)) => {
+                    return Frame::from_bytes(payload.into())
+                        .map(Some)
+                        .map_err(|e| anyhow!("frame parse error: {:?}", e));
+                }
+                Some((OP_PING, payload)) => {
+                    // A pong must echo the ping's payload.
+                    debug!("WebSocket PING received, replying with PONG");
+                    self.send_control(OP_PONG, &payload)?;
+                }
+                Some((OP_PONG, _)) => debug!("WebSocket PONG received"),
+                Some((OP_CLOSE, _)) => return Err(anyhow!("peer sent WebSocket CLOSE")),
+                Some((opcode, _)) => warn!("ignoring unknown WebSocket opcode {opcode:#x}"),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The underlying stream, for switching blocking mode after the
+    /// handshake has completed.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Send a protocol frame as one masked binary message.
+    pub fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        self.send_message(OP_BINARY, &frame.to_bytes())
+    }
+
+    fn send_control(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
+        self.send_message(opcode, payload)
+    }
+
+    fn send_message(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
+        let mut out = Vec::with_capacity(payload.len() + 14);
+        out.push(0x80 | opcode); // FIN + opcode
+
+        // RFC 6455: every client frame is masked.
+        let len = payload.len();
+        if len < 126 {
+            out.push(0x80 | len as u8);
+        } else if len < 65536 {
+            out.push(0x80 | 126);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            out.push(0x80 | 127);
+            out.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+
+        let mask = random_bytes();
+        out.extend_from_slice(&mask);
+        out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+
+        write_all_nonblocking(&mut self.stream, &out)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Pull available bytes into the buffer; WouldBlock just means "no more".
+    fn fill(&mut self) -> Result<()> {
+        loop {
+            match self.stream.read(&mut self.scratch) {
+                Ok(0) => return Err(anyhow!("connection closed by peer")),
+                Ok(n) => {
+                    self.rx.extend_from_slice(&self.scratch[..n]);
+                    if n < self.scratch.len() {
+                        return Ok(());
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Consume one complete message from the buffer, if there is one.
+    ///
+    /// Fragmented messages are assembled here, so callers only ever see whole
+    /// messages. Returns the opcode of the message's first frame.
+    fn take_message(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
+        let Some((fin, opcode, payload, consumed)) = parse_frame(&self.rx)? else {
+            return Ok(None);
+        };
+        self.rx.drain(..consumed);
+
+        // Control frames are never fragmented and may arrive mid-message.
+        if opcode & 0x8 != 0 {
+            return Ok(Some((opcode, payload)));
+        }
+
+        if fin && self.fragment.is_empty() {
+            return Ok(Some((opcode, payload)));
+        }
+
+        self.fragment.extend_from_slice(&payload);
+        if self.fragment.len() > MAX_PAYLOAD {
+            return Err(anyhow!("fragmented message exceeds {MAX_PAYLOAD} bytes"));
+        }
+        if fin {
+            return Ok(Some((OP_BINARY, std::mem::take(&mut self.fragment))));
+        }
+        Ok(None)
+    }
+}
+
+/// Parse one frame from `buf`, returning (fin, opcode, payload, bytes consumed).
+fn parse_frame(buf: &[u8]) -> Result<Option<(bool, u8, Vec<u8>, usize)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let fin = buf[0] & 0x80 != 0;
+    let opcode = buf[0] & 0x0F;
+    let masked = buf[1] & 0x80 != 0;
+    let short_len = (buf[1] & 0x7F) as usize;
+
+    let mut offset = 2;
+    let payload_len = match short_len {
+        126 => {
+            if buf.len() < offset + 2 {
+                return Ok(None);
+            }
+            let len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+            offset += 2;
+            len
+        }
+        127 => {
+            if buf.len() < offset + 8 {
+                return Ok(None);
+            }
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&buf[offset..offset + 8]);
+            offset += 8;
+            u64::from_be_bytes(len_bytes) as usize
+        }
+        n => n,
+    };
+
+    if payload_len > MAX_PAYLOAD {
+        return Err(anyhow!("payload of {payload_len} bytes exceeds limit"));
+    }
+
+    // A server must not mask, but handle it rather than corrupting the payload.
+    let mask = if masked {
+        if buf.len() < offset + 4 {
+            return Ok(None);
+        }
+        let m = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
+        offset += 4;
+        Some(m)
+    } else {
+        None
+    };
+
+    if buf.len() < offset + payload_len {
+        return Ok(None); // Wait for the rest; buffered bytes stay put.
+    }
+
+    let mut payload = buf[offset..offset + payload_len].to_vec();
+    if let Some(m) = mask {
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= m[i % 4];
+        }
+    }
+
+    Ok(Some((fin, opcode, payload, offset + payload_len)))
+}
+
+/// Write every byte, yielding briefly when the socket is full.
+fn write_all_nonblocking<W: Write>(stream: &mut W, mut buf: &[u8]) -> Result<()> {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => return Err(anyhow!("write returned 0 bytes")),
+            Ok(n) => buf = &buf[n..],
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn random_bytes() -> [u8; 4] {
+    let r = unsafe { esp_idf_sys::esp_random() };
+    r.to_le_bytes()
+}
+
+/// A fresh 16-byte nonce, base64-encoded, as required per connection.
+fn random_key() -> String {
+    let mut nonce = [0u8; 16];
+    for chunk in nonce.chunks_mut(4) {
+        chunk.copy_from_slice(&random_bytes());
+    }
+    base64_encode(&nonce)
+}
+
+/// The server's expected Sec-WebSocket-Accept: base64(sha1(key + GUID)).
+fn accept_key(key: &str) -> String {
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut input = Vec::with_capacity(key.len() + GUID.len());
+    input.extend_from_slice(key.as_bytes());
+    input.extend_from_slice(GUID.as_bytes());
+    base64_encode(&sha1(&input))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+
+    out
+}
+
+/// SHA-1, needed only to validate the handshake.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+
+    let mut message = data.to_vec();
+    let bit_len = (data.len() as u64) * 8;
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in message.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in block.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_matches_known_vectors() {
+        assert_eq!(
+            sha1(b"abc"),
+            [
+                0xA9, 0x99, 0x3E, 0x36, 0x47, 0x06, 0x81, 0x6A, 0xBA, 0x3E, 0x25, 0x71, 0x78, 0x50,
+                0xC2, 0x6C, 0x9C, 0xD0, 0xD8, 0x9D
+            ]
+        );
+    }
+
+    #[test]
+    fn accept_key_matches_rfc6455_example() {
+        // RFC 6455 section 1.3.
+        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn base64_handles_padding() {
+        assert_eq!(base64_encode(b"a"), "YQ==");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn partial_frames_are_not_consumed() {
+        // Header says 4 bytes of payload but only 2 have arrived.
+        let buf = [0x82, 0x04, 0xDE, 0xAD];
+        assert!(parse_frame(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_a_complete_unmasked_frame() {
+        let buf = [0x82, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x99];
+        let (fin, opcode, payload, consumed) = parse_frame(&buf).unwrap().unwrap();
+        assert!(fin);
+        assert_eq!(opcode, OP_BINARY);
+        assert_eq!(payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(consumed, 6, "trailing byte belongs to the next frame");
+    }
+}
