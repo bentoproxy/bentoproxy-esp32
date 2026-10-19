@@ -368,16 +368,20 @@ fn write_all_nonblocking<W: Write>(
                         WRITE_TIMEOUT.as_secs()
                     ));
                 }
-                // Wait for the socket rather than sleeping a whole scheduler
-                // tick. TLS can need to read before it can write (WANT_READ),
-                // so wake on either direction.
+                // Wait until the socket can take more, rather than sleeping a
+                // whole scheduler tick. Writable only: waiting on readable too
+                // returned at once whenever the orchestrator had sent anything,
+                // which spun this loop ~35,000 times in 20s. A WANT_READ during
+                // a write is rare and the timeout bounds it.
                 match wait_fd {
                     Some(fd) => {
-                        let mut read = crate::wait::FdSet::new();
                         let mut write = crate::wait::FdSet::new();
-                        read.add(fd);
                         write.add(fd);
-                        crate::wait::wait(read, write, std::time::Duration::from_millis(50));
+                        crate::wait::wait(
+                            crate::wait::FdSet::new(),
+                            write,
+                            std::time::Duration::from_millis(50),
+                        );
                     }
                     None => std::thread::sleep(std::time::Duration::from_millis(1)),
                 }

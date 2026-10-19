@@ -6,7 +6,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
 # WiFi receive buffers. Sized to back the block-ack window below: the window
 # cannot usefully exceed the buffers available to hold what it lets in.
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+# 16 suffices now that frames are copied out at once (see L2_TO_L3_COPY):
+# 32 measured identical throughput and only allowed larger bursts.
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 
 # Enable WiFi
@@ -19,8 +21,31 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 # Throughput tuning. The relay is a pure forwarder, so TCP window and WiFi
 # buffer sizes set the ceiling; IDF's defaults are sized for small sensor
 # payloads and cap a single stream well below link speed.
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+# Copy each received frame out of the WiFi driver's buffers into lwIP's own.
+#
+# Without this, unread TCP data stays in the driver's RX buffers until the
+# relay reads it, and those buffers are shared with every other incoming
+# frame. Several busy streams filled all of them, the board could no longer
+# receive the ACKs for its own upload to the orchestrator, the upload stalled,
+# the relay stopped reading, and nothing drained: four parallel streams fell
+# from 533 KB/s to near zero and the session died. Copying frees the driver
+# buffer at once, so unread data can never starve the radio.
+CONFIG_LWIP_L2_TO_L3_COPY=y
+
+# Per-connection receive window. Unread data now lives on the heap, so the
+# window is a memory budget, not a speed setting:
+#   ~150KB free at idle - 26KB WiFi RX bursts - 32KB upload queue - 20KB
+#   margin = ~72KB for unread data, / 12 streams (the node's limit) = ~6KB.
+# 4 x MSS. At 8.6KB the heap fell to 5KB under 12 streams; at 32KB four
+# streams deadlocked. Single-stream speed is lower; aggregate is what counts.
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# Send queue per connection. Only the orchestrator connection sends much, and
+# its upload is the relay's critical path, so this is a throughput/memory dial
+# measured under 12 parallel streams:
+#   32KB: ~449 KB/s aggregate, heap low-water 13KB
+#   24KB: ~430 KB/s, heap low-water 22KB   <- chosen: 4% slower, ~2x margin
+#   16KB: ~340 KB/s, heap low-water 32KB
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=24576
 CONFIG_LWIP_TCP_MSS=1440
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
