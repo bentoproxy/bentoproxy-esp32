@@ -285,6 +285,8 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, settings: &Settings) 
             Ok(()) => {
                 info!("WiFi connected: {:?}", wifi.wifi().sta_netif().get_ip_info());
 
+                log_link_quality();
+
                 // IDF enables modem sleep by default: the radio dozes between
                 // beacons and every packet waits for it to wake. Right for a
                 // battery sensor, ruinous for a relay that is always moving
@@ -321,6 +323,29 @@ fn obtain_credentials(settings: &Settings, nvs: NvsPartition) -> Result<(String,
     Settings::save_credentials(nvs, &issued.device_id, &issued.device_token)?;
 
     Ok((issued.device_id, issued.device_token))
+}
+
+/// Log the channel width and signal the router actually granted.
+fn log_link_quality() {
+    let mut ap: esp_idf_sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+    let mut bandwidth: esp_idf_sys::wifi_bandwidth_t = 0;
+    unsafe {
+        if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) != esp_idf_sys::ESP_OK {
+            return;
+        }
+        esp_idf_sys::esp_wifi_get_bandwidth(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut bandwidth);
+    }
+
+    let width = if bandwidth == esp_idf_sys::wifi_bandwidth_t_WIFI_BW_HT40 { "40MHz" } else { "20MHz" };
+    let secondary = match ap.second {
+        esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_ABOVE => "above",
+        esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_BELOW => "below",
+        _ => "none",
+    };
+    info!(
+        "link: channel {}, secondary {secondary}, configured {width}, RSSI {} dBm",
+        ap.primary, ap.rssi
+    );
 }
 
 /// One orchestrator connection, from handshake until the link drops.
