@@ -1,0 +1,10 @@
+# Layout for secure-boot units (sdkconfig.secure). The signed bootloader with
+# flash encryption outgrows the 32KB before 0x8000, so the partition table
+# sits at 0x10000 and the small partitions follow it. The app compiles the
+# table offset in, so secure units need images from tools/build-secure.sh.
+# Name,   Type, SubType, Offset,   Size,
+nvs,      data, nvs,     0x11000,  0x6000,
+otadata,  data, ota,     0x17000,  0x2000,
+phy_init, data, phy,     0x19000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x300000,
+ota_1,    app,  ota_1,   0x320000, 0x300000,

@@ -1,0 +1,18 @@
+# Secure Boot V2 (RSA-3072) and flash encryption, for production units.
+#
+# PERMANENT: the first boot of a bootloader built with this burns eFuses that
+# can never be reverted. Read docs/secure-boot.md and use a spare board.
+# Applied on top of sdkconfig.defaults by tools/build-secure.sh, which fills
+# in the signing key path; never build it into a normal release.
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+# Development mode keeps the board reflashable over USB (encrypted writes);
+# release mode would allow updates only over the air.
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+# Keep USB download mode so a mistake can still be recovered from.
+CONFIG_SECURE_INSECURE_ALLOW_DL_MODE=y
+# Room for the bigger bootloader; see partitions-secure.csv.
+CONFIG_PARTITION_TABLE_OFFSET=0x10000
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions-secure.csv"
