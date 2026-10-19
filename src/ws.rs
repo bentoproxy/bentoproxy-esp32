@@ -22,9 +22,9 @@ const OP_PONG: u8 = 0xA;
 /// Payload cap for a single message. The orchestrator never sends more, and
 /// without a limit a bad length prefix would try to allocate past free heap.
 const MAX_PAYLOAD: usize = 64 * 1024;
-/// Outgoing buffer reserved once per connection: one 16KB relay frame plus
-/// the protocol and WebSocket headers.
-const TX_CAPACITY: usize = 16 * 1024 + 64;
+/// Outgoing buffer reserved once per connection: one relay frame (8KB, see
+/// RELAY_BUFFER) plus the protocol and WebSocket headers.
+const TX_CAPACITY: usize = 8 * 1024 + 64;
 /// bentoproxy-protocol frame header: type, flags, stream id, payload length.
 const PROTOCOL_HEADER: usize = 10;
 
@@ -196,6 +196,7 @@ impl<S: Read + Write> WsConn<S> {
         // at once.
         let Self { stream, tx, wait_fd, .. } = self;
 
+        let build_started = std::time::Instant::now();
         tx.clear();
         tx.push(0x80 | opcode); // FIN + opcode
 
@@ -213,13 +214,14 @@ impl<S: Read + Write> WsConn<S> {
 
         let mask = random_bytes();
         tx.extend_from_slice(&mask);
-        // The mask runs continuously across header and body.
-        tx.extend(
-            head.iter()
-                .chain(body.iter())
-                .enumerate()
-                .map(|(i, b)| b ^ mask[i % 4]),
-        );
+
+        // Copy, then mask in place a word at a time. Byte-at-a-time masking
+        // ran over every relayed byte on the critical write path.
+        let start = tx.len();
+        tx.extend_from_slice(head);
+        tx.extend_from_slice(body);
+        apply_mask(&mut tx[start..], mask);
+        crate::profile::build_done(build_started);
 
         // One write for header and payload together: two writes per frame put
         // a small packet on the wire ahead of each payload.
@@ -357,7 +359,10 @@ fn write_all_nonblocking<W: Write>(
     let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
 
     while !buf.is_empty() {
-        match stream.write(buf) {
+        let call_started = std::time::Instant::now();
+        let result = stream.write(buf);
+        crate::profile::tls_call_done(call_started);
+        match result {
             Ok(0) => return Err(anyhow!("write returned 0 bytes")),
             Ok(n) => buf = &buf[n..],
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -373,6 +378,7 @@ fn write_all_nonblocking<W: Write>(
                 // returned at once whenever the orchestrator had sent anything,
                 // which spun this loop ~35,000 times in 20s. A WANT_READ during
                 // a write is rare and the timeout bounds it.
+                let wait_started = std::time::Instant::now();
                 match wait_fd {
                     Some(fd) => {
                         let mut write = crate::wait::FdSet::new();
@@ -385,11 +391,39 @@ fn write_all_nonblocking<W: Write>(
                     }
                     None => std::thread::sleep(std::time::Duration::from_millis(1)),
                 }
+                crate::profile::wait_done(wait_started);
             }
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
+}
+
+/// XOR a WebSocket mask over `buf`, which starts at mask phase 0.
+///
+/// Works a 32-bit word at a time over the aligned middle of the buffer, with
+/// the mask rotated to keep its byte phase, and byte-wise over the unaligned
+/// ends. Verified identical to byte-wise masking at every alignment and frame
+/// size the relay produces.
+fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
+    // SAFETY: every bit pattern is a valid u32; align_to_mut only re-slices.
+    let (prefix, words, suffix) = unsafe { buf.align_to_mut::<u32>() };
+
+    let p = prefix.len();
+    for (i, b) in prefix.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+
+    let rotated = [mask[p % 4], mask[(p + 1) % 4], mask[(p + 2) % 4], mask[(p + 3) % 4]];
+    let word_mask = u32::from_ne_bytes(rotated);
+    for w in words.iter_mut() {
+        *w ^= word_mask;
+    }
+
+    let offset = p + words.len() * 4;
+    for (i, b) in suffix.iter_mut().enumerate() {
+        *b ^= mask[(offset + i) % 4];
+    }
 }
 
 fn random_bytes() -> [u8; 4] {

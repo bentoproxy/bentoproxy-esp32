@@ -40,12 +40,12 @@ CONFIG_LWIP_L2_TO_L3_COPY=y
 # streams deadlocked. Single-stream speed is lower; aggregate is what counts.
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
 # Send queue per connection. Only the orchestrator connection sends much, and
-# its upload is the relay's critical path, so this is a throughput/memory dial
-# measured under 12 parallel streams:
-#   32KB: ~449 KB/s aggregate, heap low-water 13KB
-#   24KB: ~430 KB/s, heap low-water 22KB   <- chosen: 4% slower, ~2x margin
-#   16KB: ~340 KB/s, heap low-water 32KB
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=24576
+# its upload is the relay's critical path. A throughput/memory dial, measured
+# under 12 parallel streams once tiT had its own core (see below):
+#   24KB: ~502 KB/s aggregate, heap low-water 29KB
+#   32KB: ~579 KB/s, heap low-water 22KB   <- chosen
+# Before the core split it bought only 4%, because the CPU was the limit.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_MSS=1440
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
@@ -76,8 +76,26 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
 # this core.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# Outgoing TLS record size. IDF caps outgoing records at 4KB (incoming stay at
-# 16KB), so every 8KB relay frame left as two separately encrypted records and
-# two socket writes, each able to stall. Once uploading to the orchestrator
-# became the bottleneck, that doubled the work on the critical path.
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+# Outgoing TLS record size. IDF's 4KB default split every relay frame into two
+# separately encrypted records and two socket writes. Frames are now capped by
+# the 5760-byte TCP window, so 8KB fits each in one record; 16KB only held
+# memory the heap needed.
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=8192
+
+# Per-task CPU accounting, for the profile line. Lets the relay tell "busy"
+# from "waiting" per core, which its own timers cannot: time inside a write
+# includes both encryption and waiting for the socket to drain.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# Relieve lwIP's TCP/IP thread (tiT), the measured bottleneck. Every packet and
+# every socket send from the relay is serialised through it, and a send blocks
+# the caller until tiT has processed it. Under 12 streams core 0 was 88% busy
+# running tiT (46%) and the WiFi driver (32%) while core 1 sat 71% idle, and the
+# relay spent 9.3s of each 15s blocked inside TLS writes waiting on tiT.
+# WiFi keeps core 0; tiT and the relay share core 1.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+# lwIP's hot paths from internal RAM rather than flash: no cache misses on
+# the busiest code in the system.
+CONFIG_LWIP_IRAM_OPTIMIZATION=y

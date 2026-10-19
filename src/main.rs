@@ -69,11 +69,13 @@ const TLS_TIMEOUT_MS: u32 = 30_000;
 const IDLE_WAIT: Duration = Duration::from_millis(20);
 /// Per-stream read buffer, and so the largest relay frame.
 ///
-/// Sized to fit one outgoing TLS record (16KB, see sdkconfig) after the
-/// WebSocket header and protocol framing, so each frame is encrypted and
-/// written once. Reads were filling an 8KB buffer every time, meaning data
-/// arrived faster than one buffer per read.
-const RELAY_BUFFER: usize = 16 * 1024 - 64;
+/// A read can never return more than one TCP receive window (5760 bytes, see
+/// sdkconfig), so 16KB here was two-thirds empty; under 12 streams every read
+/// measured exactly 5760. Sized to fit one 8KB outgoing TLS record after the
+/// WebSocket and protocol headers, so each frame is still encrypted and
+/// written once, and the memory goes back to the heap, which is the scarce
+/// resource.
+const RELAY_BUFFER: usize = 8 * 1024 - 64;
 /// Bytes a single stream may move per pass, so one busy download cannot
 /// starve the other streams or delay the keep-alive ping.
 const PER_STREAM_BUDGET: usize = 32 * 1024;
@@ -398,6 +400,7 @@ fn run_session(
                 streams.len()
             );
             info!("{}", profile::take_report(seconds));
+            info!("{}", profile::task_report());
             // Heap margin, so buffer tuning shows its cost before it shows a
             // crash. The minimum is the low-water mark since boot.
             info!(
