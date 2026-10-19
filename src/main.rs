@@ -6,6 +6,7 @@
 //! Hardware: ESP32-S3 (or compatible)
 //! Protocol: binary frames over WebSocket (see bentoproxy-protocol)
 
+mod claim;
 mod connect;
 mod netfilter;
 mod provisioning;
@@ -37,6 +38,7 @@ use log::{debug, error, info, warn};
 
 use bentoproxy_protocol::{Frame, FrameType};
 use connect::{Connector, Outcome};
+use esp_idf_svc::nvs::EspDefaultNvsPartition as NvsPartition;
 use settings::Settings;
 use tls::TlsStream;
 use ws::WsConn;
@@ -97,8 +99,7 @@ fn main() -> ! {
         Err(e) => restart(&format!("could not read settings: {e:?}")),
     };
 
-    info!("Device ID: {}", settings.device_id);
-
+    let nvs_for_claim = nvs.clone();
     let mut wifi = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
         Ok(wifi) => wifi,
         Err(e) => restart(&format!("WiFi init failed: {e:?}")),
@@ -109,6 +110,18 @@ fn main() -> ! {
         // beats sitting in a panicked state until someone power-cycles it.
         restart(&format!("WiFi connection failed: {e:?}"));
     }
+
+    // Credentials arrive from a claim, not from the owner: the node announces
+    // itself and waits for them to enter its setup code in the dashboard.
+    let credentials = match (settings.device_id.clone(), settings.device_token.clone()) {
+        (Some(device_id), Some(device_token)) => (device_id, device_token),
+        _ => match obtain_credentials(&settings, nvs_for_claim) {
+            Ok(credentials) => credentials,
+            Err(e) => restart(&format!("could not obtain credentials: {e:?}")),
+        },
+    };
+
+    info!("Device ID: {}", credentials.0);
 
     let mut led = PinDriver::output(peripherals.pins.gpio2).unwrap();
     led.set_low().ok();
@@ -121,7 +134,7 @@ fn main() -> ! {
     loop {
         info!("Connecting to orchestrator: {}", settings.orchestrator_url);
 
-        match run_session(&settings, &connector, &mut led) {
+        match run_session(&settings, &credentials, &connector, &mut led) {
             Ok(()) => info!("Orchestrator connection closed"),
             Err(e) => error!("Session ended: {e:?}"),
         }
@@ -234,8 +247,26 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, settings: &Settings) 
     Err(anyhow!("no WiFi after {WIFI_ATTEMPTS} attempts"))
 }
 
+/// Announce this node and wait for its owner to claim it, storing whatever
+/// the orchestrator issues.
+fn obtain_credentials(settings: &Settings, nvs: NvsPartition) -> Result<(String, String)> {
+    let hw_id = claim::hardware_id()?;
+    let setup_code = Settings::setup_code(nvs.clone())?;
+    let api_base = claim::api_base_from_ws_url(&settings.orchestrator_url)?;
+
+    let issued = claim::wait_for_claim(&api_base, &hw_id, &setup_code)?;
+    Settings::save_credentials(nvs, &issued.device_id, &issued.device_token)?;
+
+    Ok((issued.device_id, issued.device_token))
+}
+
 /// One orchestrator connection, from handshake until the link drops.
-fn run_session(settings: &Settings, connector: &Connector, led: &mut Led) -> Result<()> {
+fn run_session(
+    settings: &Settings,
+    credentials: &(String, String),
+    connector: &Connector,
+    led: &mut Led,
+) -> Result<()> {
     let (host, port, path) = parse_url(&settings.orchestrator_url)?;
 
     let mut tls = TlsStream::connect(host, port, TLS_TIMEOUT_MS)?;
@@ -245,8 +276,9 @@ fn run_session(settings: &Settings, connector: &Connector, led: &mut Led) -> Res
 
     let mut ws = WsConn::connect(tls, host, path)?;
 
-    info!("Authenticating as {}", settings.device_id);
-    ws.send_frame(&Frame::auth(&settings.device_id, &settings.device_token))?;
+    let (device_id, device_token) = credentials;
+    info!("Authenticating as {device_id}");
+    ws.send_frame(&Frame::auth(device_id, device_token))?;
 
     let response = read_frame_blocking(&mut ws)?;
     if response.frame_type != FrameType::Data || !response.flags.has_ack() {

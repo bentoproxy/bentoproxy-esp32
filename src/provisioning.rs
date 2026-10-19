@@ -19,7 +19,7 @@ use embedded_svc::wifi::{AccessPointConfiguration, ClientConfiguration, Configur
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::http::server::{Configuration as HttpConfig, EspHttpServer};
 use esp_idf_svc::http::Method;
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use esp_idf_svc::io::Write;
 use log::{info, warn};
@@ -31,10 +31,6 @@ use crate::settings::Settings;
 const PORTAL_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
 /// Body cap for the save request; the form is far smaller.
 const MAX_BODY: usize = 1024;
-/// NVS key holding this unit's setup code.
-const SETUP_CODE_KEY: &str = "setup_code";
-/// WPA2 needs at least 8 characters.
-const SETUP_CODE_LEN: usize = 8;
 
 /// Run setup until credentials arrive. Returns once they are stored.
 pub fn run(
@@ -42,7 +38,8 @@ pub fn run(
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
 ) -> Result<()> {
-    let (ap_ssid, setup_code) = identity(&nvs)?;
+    let ap_ssid = ap_name()?;
+    let setup_code = Settings::setup_code(nvs.clone())?;
 
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(modem, sys_loop.clone(), Some(nvs.clone()))?,
@@ -78,7 +75,13 @@ pub fn run(
 
     let networks = Arc::new(Mutex::new(scan(&mut wifi)));
     let saved = Arc::new(AtomicBool::new(false));
-    let _server = serve(nvs, networks.clone(), saved.clone(), ap_ssid.clone())?;
+    let _server = serve(
+        nvs,
+        networks.clone(),
+        saved.clone(),
+        ap_ssid.clone(),
+        setup_code.clone(),
+    )?;
     let _dns = redirect_dns();
 
     // Rescan periodically: a customer may switch their router's band or move
@@ -98,49 +101,15 @@ pub fn run(
     Ok(())
 }
 
-/// AP name and setup code for this unit.
-///
-/// The name comes from the MAC, which is public anyway — it is the AP's BSSID,
-/// in every beacon frame. The code must NOT: deriving it from the MAC let
-/// anyone in WiFi range read the BSSID, compute the code, join the setup
-/// network and point the node at their own orchestrator. So the code is random
-/// per device, generated once and kept in NVS, ready to print on the label.
-fn identity(nvs: &EspDefaultNvsPartition) -> Result<(String, String)> {
+/// AP name for this unit. The MAC is fine here: it is the AP's own BSSID,
+/// broadcast in every beacon. The setup code is not derived from it — see
+/// Settings::setup_code.
+fn ap_name() -> Result<String> {
     let mut mac = [0u8; 6];
     esp_idf_sys::esp!(unsafe {
         esp_idf_sys::esp_read_mac(mac.as_mut_ptr(), esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_STA)
     })?;
-    let ssid = format!("BentoProxy-{:02X}{:02X}", mac[4], mac[5]);
-
-    let mut store = EspNvs::new(nvs.clone(), crate::settings::NAMESPACE, true)?;
-    let code = match stored_code(&mut store)? {
-        Some(code) => code,
-        None => {
-            let code = random_code();
-            store.set_str(SETUP_CODE_KEY, &code)?;
-            info!("generated a new setup code for this device");
-            code
-        }
-    };
-
-    Ok((ssid, code))
-}
-
-fn stored_code(store: &mut EspNvs<NvsDefault>) -> Result<Option<String>> {
-    let mut buf = [0u8; 32];
-    Ok(store.get_str(SETUP_CODE_KEY, &mut buf)?.map(|s| s.to_string()))
-}
-
-/// Eight characters from a 32-symbol alphabet: 40 bits of entropy, and no
-/// characters a customer could misread off a label.
-fn random_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    (0..SETUP_CODE_LEN)
-        .map(|_| {
-            let r = unsafe { esp_idf_sys::esp_random() };
-            ALPHABET[(r % ALPHABET.len() as u32) as usize] as char
-        })
-        .collect()
+    Ok(format!("BentoProxy-{:02X}{:02X}", mac[4], mac[5]))
 }
 
 fn scan(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Vec<(String, i8)> {
@@ -175,23 +144,38 @@ fn serve(
     networks: Arc<Mutex<Vec<(String, i8)>>>,
     saved: Arc<AtomicBool>,
     ap_ssid: String,
+    setup_code: String,
 ) -> Result<EspHttpServer<'static>> {
-    let mut server = EspHttpServer::new(&HttpConfig::default())?;
+    // The default 6KB handler stack leaves little room for building a page
+    // and holding the request body at once.
+    let mut server = EspHttpServer::new(&HttpConfig {
+        stack_size: 10240,
+        ..HttpConfig::default()
+    })?;
 
     let page_networks = networks.clone();
+    let page_code = setup_code.clone();
     server.fn_handler("/", Method::Get, move |req| {
         let list = page_networks.lock().map(|l| l.clone()).unwrap_or_default();
         let mut response = req.into_ok_response()?;
-        response.write_all(setup_page(&list, &ap_ssid).as_bytes())?;
+        response.write_all(setup_page(&list, &ap_ssid, &page_code).as_bytes())?;
         Ok::<(), anyhow::Error>(())
     })?;
 
     let save_nvs = nvs.clone();
     server.fn_handler("/save", Method::Post, move |mut req| {
+        // A form can arrive split across reads; stop at EOF or the cap.
         let mut buf = [0u8; MAX_BODY];
-        let len = req.read(&mut buf)?;
+        let mut len = 0;
+        while len < buf.len() {
+            match req.read(&mut buf[len..])? {
+                0 => break,
+                n => len += n,
+            }
+        }
         let body = std::str::from_utf8(&buf[..len]).unwrap_or_default().to_string();
 
+        info!("setup submitted ({} bytes)", body.len());
         match store(&body, save_nvs.clone()) {
             Ok(ssid) => {
                 let mut response = req.into_ok_response()?;
@@ -200,7 +184,10 @@ fn serve(
             }
             Err(e) => {
                 warn!("setup rejected: {e}");
-                let mut response = req.into_status_response(400)?;
+                // Render the reason as a normal page: a handler that returns
+                // Err here produces the server's own opaque 500, which tells
+                // the owner nothing about what to fix.
+                let mut response = req.into_ok_response()?;
                 response.write_all(error_page(&e.to_string()).as_bytes())?;
             }
         }
@@ -233,12 +220,6 @@ fn store(body: &str, nvs: EspDefaultNvsPartition) -> Result<String> {
     let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
 
     let ssid = get("ssid").filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("no network selected"))?;
-    let device_id = get("device_id")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("device ID is required"))?;
-    let device_token = get("device_token")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("device token is required"))?;
 
     let settings = Settings {
         wifi_ssid: ssid.clone(),
@@ -246,9 +227,11 @@ fn store(body: &str, nvs: EspDefaultNvsPartition) -> Result<String> {
         wifi_password: get("password").unwrap_or_default(),
         orchestrator_url: get("orch_url")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "wss://bentoproxy.com:8443/ws/device".to_string()),
-        device_id,
-        device_token,
+            .unwrap_or_else(|| crate::settings::DEFAULT_ORCHESTRATOR_URL.to_string()),
+        // The owner claims this node from their dashboard instead of pasting
+        // credentials into a form.
+        device_id: None,
+        device_token: None,
     };
 
     let mut nvs = EspNvs::new(nvs, crate::settings::NAMESPACE, true)?;
@@ -370,7 +353,8 @@ fn dns_reply(query: &[u8]) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-fn setup_page(networks: &[(String, i8)], ap_ssid: &str) -> String {
+fn setup_page(networks: &[(String, i8)], ap_ssid: &str, setup_code: &str) -> String {
+    let default_url = crate::settings::DEFAULT_ORCHESTRATOR_URL;
     let options = if networks.is_empty() {
         "<option value=\"\">No networks found — wait a moment and reload</option>".to_string()
     } else {
@@ -388,8 +372,6 @@ fn setup_page(networks: &[(String, i8)], ap_ssid: &str) -> String {
             .join("")
     };
 
-    let compiled_id = option_env!("DEVICE_ID").unwrap_or("");
-    let compiled_token = option_env!("DEVICE_TOKEN").unwrap_or("");
 
     format!(
         r#"<!doctype html>
@@ -417,7 +399,7 @@ fn setup_page(networks: &[(String, i8)], ap_ssid: &str) -> String {
   <p class="sub">{ap_ssid}</p>
   <form method="POST" action="/save">
     <label for="ssid">WiFi network</label>
-    <select id="ssid" name="ssid">{options}</select>
+    <select id="ssid" name="ssid" required>{options}</select>
 
     <label for="password">WiFi password</label>
     <input id="password" name="password" type="password" autocomplete="off"
@@ -425,18 +407,15 @@ fn setup_page(networks: &[(String, i8)], ap_ssid: &str) -> String {
 
     <details>
       <summary>Advanced</summary>
-      <label for="device_id">Device ID</label>
-      <input id="device_id" name="device_id" value="{compiled_id}">
-      <label for="device_token">Device token</label>
-      <input id="device_token" name="device_token" value="{compiled_token}">
       <label for="orch_url">Orchestrator URL</label>
-      <input id="orch_url" name="orch_url" value="wss://bentoproxy.com:8443/ws/device">
+      <input id="orch_url" name="orch_url" value="{default_url}">
     </details>
 
     <button type="submit">Save and connect</button>
   </form>
-  <p class="note">Only 2.4 GHz networks appear here. This node has no 5 GHz radio,
-  so a 5 GHz-only network cannot be used.</p>
+  <p class="note">Next you will enter this node's setup code
+  <strong>{setup_code}</strong> in your BentoProxy dashboard to link it to your
+  account. Only 2.4 GHz networks appear above: this node has no 5 GHz radio.</p>
 </body></html>"#
     )
 }
