@@ -41,7 +41,8 @@ use esp_idf_sys as _; // Required for esp-idf bindings
 esp_idf_sys::esp_app_desc!();
 use log::{debug, error, info, warn};
 
-use bentoproxy_protocol::{Frame, FrameType};
+use bentoproxy_protocol::{Capabilities, Frame, FrameType, NodeKind};
+use esp_idf_hal::task::watchdog::{config::Config as WatchdogConfig, TWDTDriver};
 use connect::{Connector, Outcome};
 use esp_idf_svc::nvs::EspDefaultNvsPartition as NvsPartition;
 use settings::Settings;
@@ -56,9 +57,18 @@ use ws::WsConn;
 /// spare slots absorb bursts and leave room for an owner-triggered speed test,
 /// which a node saturated with relayed traffic would otherwise refuse.
 const MAX_CONCURRENT_STREAMS: usize = 12;
+/// Streams the orchestrator should route here at once, declared at auth.
+/// Below MAX_CONCURRENT_STREAMS on purpose: the spare slots absorb bursts and
+/// keep room for an owner-triggered speed test on a busy node.
+const ROUTABLE_STREAMS: u16 = 8;
+/// A relay loop that stops feeding the watchdog this long reboots the node.
+/// Well above the longest legitimate stall in the loop (the 20s write
+/// deadline), so it only fires on a real hang.
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(45);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WIFI_ATTEMPTS: u32 = 5;
+const WIFI_ATTEMPTS_NOT_VISIBLE: u32 = 2;
 /// How long setup stays open after the saved network could not be joined,
 /// before rebooting to try that network again.
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -141,12 +151,16 @@ fn main() -> ! {
 
     let nvs_for_claim = nvs.clone();
     let nvs_for_portal = nvs.clone();
-    let mut wifi = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
-        Ok(wifi) => wifi,
+    let (mut wifi, network_visible) = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
+        Ok(result) => result,
         Err(e) => restart(&format!("WiFi init failed: {e:?}")),
     };
 
-    if let Err(e) = connect_wifi(&mut wifi, &settings) {
+    // A network the scan cannot see is most likely gone — the node moved —
+    // so give up quickly and open setup, rather than spending ~100s on
+    // retries. Two attempts, not one, in case it is hidden or just missed.
+    let attempts = if network_visible { WIFI_ATTEMPTS } else { WIFI_ATTEMPTS_NOT_VISIBLE };
+    if let Err(e) = connect_wifi(&mut wifi, &settings, attempts) {
         // Retrying forever helps nobody if the node has moved: its saved
         // network is simply not there. Reboot into setup instead, which times
         // out and retries the saved network, so an outage recovers by itself.
@@ -175,6 +189,17 @@ fn main() -> ! {
     let mut led = PinDriver::output(peripherals.pins.gpio2).unwrap();
     led.set_low().ok();
 
+    // Two different wedges have left nodes connected but dead until someone
+    // power-cycled them. Whatever the next one is, the watchdog turns it into
+    // a reboot, and the node reconnects on its own.
+    let mut watchdog_config = WatchdogConfig::new();
+    watchdog_config.duration = WATCHDOG_TIMEOUT;
+    watchdog_config.panic_on_trigger = true;
+    let mut watchdog = match TWDTDriver::new(peripherals.twdt, &watchdog_config) {
+        Ok(watchdog) => watchdog,
+        Err(e) => restart(&format!("could not start the watchdog: {e:?}")),
+    };
+
     let connector = match Connector::spawn() {
         Ok(connector) => connector,
         Err(e) => restart(&format!("could not start the connect worker: {e:?}")),
@@ -183,7 +208,7 @@ fn main() -> ! {
     loop {
         info!("Connecting to orchestrator: {}", settings.orchestrator_url);
 
-        match run_session(&settings, &credentials, &connector, &mut led) {
+        match run_session(&settings, &credentials, &connector, &mut led, &mut watchdog) {
             Ok(()) => info!("Orchestrator connection closed"),
             Err(e) => error!("Session ended: {e:?}"),
         }
@@ -235,25 +260,36 @@ fn init_wifi(
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     settings: &Settings,
-) -> Result<BlockingWifi<EspWifi<'static>>> {
+) -> Result<(BlockingWifi<EspWifi<'static>>, bool)> {
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
     wifi.start()?;
 
-    // A scan makes "wrong SSID" and "out of range" distinguishable in the log.
-    match wifi.scan() {
+    // A scan makes "wrong SSID" and "out of range" distinguishable in the log,
+    // and tells the caller whether retrying is worth it.
+    let visible = match wifi.scan() {
         Ok(aps) => match aps.iter().find(|ap| ap.ssid.as_str() == settings.wifi_ssid) {
-            Some(ap) => info!(
-                "Network '{}' found: channel {}, RSSI {}",
-                settings.wifi_ssid, ap.channel, ap.signal_strength
-            ),
-            None => warn!(
-                "Network '{}' not visible; {} other networks in range",
-                settings.wifi_ssid,
-                aps.len()
-            ),
+            Some(ap) => {
+                info!(
+                    "Network '{}' found: channel {}, RSSI {}",
+                    settings.wifi_ssid, ap.channel, ap.signal_strength
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "Network '{}' not visible; {} other networks in range",
+                    settings.wifi_ssid,
+                    aps.len()
+                );
+                false
+            }
         },
-        Err(e) => warn!("WiFi scan failed: {e:?}"),
-    }
+        // A failed scan says nothing either way: assume visible.
+        Err(e) => {
+            warn!("WiFi scan failed: {e:?}");
+            true
+        }
+    };
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
         ssid: settings
@@ -274,12 +310,16 @@ fn init_wifi(
         ..Default::default()
     }))?;
 
-    Ok(wifi)
+    Ok((wifi, visible))
 }
 
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, settings: &Settings) -> Result<()> {
-    for attempt in 1..=WIFI_ATTEMPTS {
-        info!("WiFi attempt {attempt}/{WIFI_ATTEMPTS} to '{}'", settings.wifi_ssid);
+fn connect_wifi(
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    settings: &Settings,
+    attempts: u32,
+) -> Result<()> {
+    for attempt in 1..=attempts {
+        info!("WiFi attempt {attempt}/{attempts} to '{}'", settings.wifi_ssid);
 
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
             Ok(()) => {
@@ -309,7 +349,7 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, settings: &Settings) 
         }
     }
 
-    Err(anyhow!("no WiFi after {WIFI_ATTEMPTS} attempts"))
+    Err(anyhow!("no WiFi after {attempts} attempts"))
 }
 
 /// Announce this node and wait for its owner to claim it, storing whatever
@@ -354,6 +394,7 @@ fn run_session(
     credentials: &(String, String),
     connector: &Connector,
     led: &mut Led,
+    watchdog: &mut TWDTDriver<'_>,
 ) -> Result<()> {
     let (host, port, path) = parse_url(&settings.orchestrator_url)?;
 
@@ -366,7 +407,14 @@ fn run_session(
 
     let (device_id, device_token) = credentials;
     info!("Authenticating as {device_id}");
-    ws.send_frame(&Frame::auth(device_id, device_token))?;
+    ws.send_frame(&Frame::auth_with_capabilities(
+        device_id,
+        device_token,
+        Capabilities {
+            max_streams: ROUTABLE_STREAMS,
+            kind: NodeKind::Microcontroller,
+        },
+    ))?;
 
     let response = read_frame_blocking(&mut ws)?;
     if response.frame_type != FrameType::Data || !response.flags.has_ack() {
@@ -390,7 +438,31 @@ fn run_session(
     let mut last_inbound = Instant::now();
     let mut reported_bytes = 0u64;
 
+    // Watched only while relaying: the handshake and auth above have their
+    // own timeouts. Dropping the subscription at session end unsubscribes.
+    let mut watch = watchdog.watch_current_task()?;
+    let mut last_feed = Instant::now();
+
+    #[cfg(feature = "wdt-selftest")]
+    let selftest_started = Instant::now();
+
     loop {
+        // Once a second is ample against a 45s timeout. Feeding on every
+        // pass took the watchdog's lock thousands of times a second under
+        // load.
+        if last_feed.elapsed() >= Duration::from_secs(1) {
+            let _ = watch.feed();
+            last_feed = Instant::now();
+        }
+
+        #[cfg(feature = "wdt-selftest")]
+        if selftest_started.elapsed() > Duration::from_secs(15) {
+            warn!("wdt-selftest: hanging the relay loop on purpose");
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+
         if last_ping.elapsed() >= PING_INTERVAL {
             debug!("Sending PING");
             ws.send_frame(&Frame::ping())?;

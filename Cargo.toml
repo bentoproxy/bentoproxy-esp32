@@ -24,6 +24,9 @@ embedded-svc = "0.28"
 # Measure raw network capacity at boot instead of trusting relay numbers.
 # Diagnostic builds only; production firmware never sends this traffic.
 netdiag = []
+# Hang the relay loop on purpose once relaying, to prove the watchdog reboots
+# the node. Test builds only.
+wdt-selftest = []
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
