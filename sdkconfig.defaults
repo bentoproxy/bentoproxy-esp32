@@ -11,3 +11,20 @@ CONFIG_ESP_WIFI_ENABLED=y
 # Use single factory app partition but larger
 CONFIG_PARTITION_TABLE_SINGLE_APP=y
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Throughput tuning. The relay is a pure forwarder, so TCP window and WiFi
+# buffer sizes set the ceiling; IDF's defaults are sized for small sensor
+# payloads and cap a single stream well below link speed.
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_MSS=1440
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+
+# Use the hardware crypto blocks for TLS rather than software implementations.
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y

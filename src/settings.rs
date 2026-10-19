@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::{info, warn};
 
-const NAMESPACE: &str = "bentoproxy";
+pub const NAMESPACE: &str = "bentoproxy";
 /// Generous enough for a long token; NVS strings are capped anyway.
 const VALUE_BUF: usize = 256;
 
@@ -86,6 +86,17 @@ impl Settings {
         nvs.set_str("wifi_ssid", &self.wifi_ssid)?;
         nvs.set_str("wifi_pass", &self.wifi_password)?;
         info!("settings written to NVS");
+        Ok(())
+    }
+
+    /// Forget stored credentials, returning the device to setup.
+    pub fn erase(partition: EspDefaultNvsPartition) -> Result<()> {
+        let mut nvs = EspNvs::new(partition, NAMESPACE, true)?;
+        for key in ["orch_url", "device_id", "device_token", "wifi_ssid", "wifi_pass"] {
+            // Absent keys are fine: the point is that none remain.
+            let _ = nvs.remove(key);
+        }
+        info!("stored settings erased");
         Ok(())
     }
 

@@ -28,7 +28,9 @@ opt-level = "z"     # Optimize for size
 lto = true
 codegen-units = 1
 debug = false
-strip = true
+# Keep symbols: espflash reads the app descriptor out of the ELF, and a
+# stripped binary makes it report the descriptor as missing.
+strip = false
 
 [profile.dev]
 debug = true

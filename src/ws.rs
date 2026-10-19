@@ -30,7 +30,10 @@ pub struct WsConn<S> {
     rx: Vec<u8>,
     /// Payload of a fragmented message assembled so far.
     fragment: Vec<u8>,
-    scratch: [u8; 1024],
+    /// Reused outgoing frame buffer: the relay sends thousands of frames a
+    /// second under load, and a fresh allocation per frame fragments the heap.
+    tx: Vec<u8>,
+    scratch: [u8; 2048],
 }
 
 impl<S: Read + Write> WsConn<S> {
@@ -94,9 +97,10 @@ impl<S: Read + Write> WsConn<S> {
         info!("WebSocket handshake complete");
         Ok(Self {
             stream,
-            rx: Vec::with_capacity(2048),
+            rx: Vec::with_capacity(4096),
             fragment: Vec::new(),
-            scratch: [0u8; 1024],
+            tx: Vec::with_capacity(8192 + 14),
+            scratch: [0u8; 2048],
         })
     }
 
@@ -143,27 +147,33 @@ impl<S: Read + Write> WsConn<S> {
     }
 
     fn send_message(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
-        let mut out = Vec::with_capacity(payload.len() + 14);
-        out.push(0x80 | opcode); // FIN + opcode
+        // Split the borrow so the reusable buffer and the stream can be held
+        // at once.
+        let Self { stream, tx, .. } = self;
+
+        tx.clear();
+        tx.push(0x80 | opcode); // FIN + opcode
 
         // RFC 6455: every client frame is masked.
         let len = payload.len();
         if len < 126 {
-            out.push(0x80 | len as u8);
+            tx.push(0x80 | len as u8);
         } else if len < 65536 {
-            out.push(0x80 | 126);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
+            tx.push(0x80 | 126);
+            tx.extend_from_slice(&(len as u16).to_be_bytes());
         } else {
-            out.push(0x80 | 127);
-            out.extend_from_slice(&(len as u64).to_be_bytes());
+            tx.push(0x80 | 127);
+            tx.extend_from_slice(&(len as u64).to_be_bytes());
         }
 
         let mask = random_bytes();
-        out.extend_from_slice(&mask);
-        out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        tx.extend_from_slice(&mask);
+        tx.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
 
-        write_all_nonblocking(&mut self.stream, &out)?;
-        self.stream.flush()?;
+        // One write for header and payload together: two writes per frame put
+        // a small packet on the wire ahead of each payload.
+        write_all_nonblocking(stream, tx)?;
+        stream.flush()?;
         Ok(())
     }
 

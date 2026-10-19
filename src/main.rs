@@ -8,6 +8,7 @@
 
 mod connect;
 mod netfilter;
+mod provisioning;
 mod settings;
 mod tls;
 mod ws;
@@ -28,6 +29,10 @@ use esp_idf_svc::{
     wifi::{BlockingWifi, EspWifi},
 };
 use esp_idf_sys as _; // Required for esp-idf bindings
+
+// Emits the esp_app_desc structure the bootloader and espflash expect in an
+// IDF application image.
+esp_idf_sys::esp_app_desc!();
 use log::{debug, error, info, warn};
 
 use bentoproxy_protocol::{Frame, FrameType};
@@ -43,9 +48,17 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WIFI_ATTEMPTS: u32 = 5;
 const TLS_TIMEOUT_MS: u32 = 30_000;
-/// Idle poll interval. Short enough to stay responsive, long enough to let
-/// lower-priority tasks (including the IDF watchdog) run.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Backoff when there is nothing to do. Only applied on an idle pass: a busy
+/// pass loops straight back, because sleeping between every read used to cap a
+/// stream at one buffer per interval (~400 KB/s) regardless of link speed.
+const IDLE_BACKOFF: Duration = Duration::from_millis(10);
+/// Per-stream read buffer. A multiple of lwIP's 1440-byte MSS.
+const RELAY_BUFFER: usize = 8192;
+/// Bytes a single stream may move per pass, so one busy download cannot
+/// starve the other streams or delay the keep-alive ping.
+const PER_STREAM_BUDGET: usize = 32 * 1024;
+/// How often to log relayed throughput.
+const THROUGHPUT_REPORT: Duration = Duration::from_secs(60);
 
 type Led = PinDriver<'static, esp_idf_hal::gpio::Gpio2, Output>;
 
@@ -59,13 +72,28 @@ fn main() -> ! {
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    // Credentials come from NVS, from the build, or from the serial console.
+    // Holding BOOT at power-on returns the node to setup, for resale or a
+    // changed router.
+    if boot_button_held(peripherals.pins.gpio0) {
+        match Settings::erase(nvs.clone()) {
+            Ok(()) => restart("factory reset requested"),
+            Err(e) => restart(&format!("factory reset failed: {e:?}")),
+        }
+    }
+
+    // Credentials come from NVS or from the build; a blank device opens its
+    // own setup network instead.
     let settings = match Settings::load(nvs.clone()) {
         Ok(Some(settings)) => settings,
-        Ok(None) => match Settings::provision(nvs.clone()) {
-            Ok(settings) => settings,
-            Err(e) => restart(&format!("provisioning failed: {e:?}")),
-        },
+        Ok(None) => {
+            info!("no settings stored; starting setup portal");
+            match provisioning::run(peripherals.modem, sys_loop, nvs) {
+                // Reboot so the normal path starts from a clean radio state
+                // rather than switching the interface out from under lwIP.
+                Ok(()) => restart("setup complete"),
+                Err(e) => restart(&format!("setup portal failed: {e:?}")),
+            }
+        }
         Err(e) => restart(&format!("could not read settings: {e:?}")),
     };
 
@@ -102,6 +130,33 @@ fn main() -> ! {
         warn!("Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
         thread::sleep(RECONNECT_DELAY);
     }
+}
+
+/// Is the BOOT button held down? Checked once at startup, so a later press
+/// cannot wipe a working node by accident.
+fn boot_button_held(pin: esp_idf_hal::gpio::Gpio0) -> bool {
+    const HOLD: Duration = Duration::from_secs(3);
+
+    let Ok(button) = esp_idf_hal::gpio::PinDriver::input(pin) else {
+        return false;
+    };
+
+    // The BOOT button pulls the pin low.
+    if button.is_high() {
+        return false;
+    }
+
+    info!("BOOT held; keep holding {}s for a factory reset", HOLD.as_secs());
+    let deadline = Instant::now() + HOLD;
+    while Instant::now() < deadline {
+        if button.is_high() {
+            info!("BOOT released; continuing normal startup");
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    true
 }
 
 /// Log the reason and reboot. Returns never, so callers can use it in place
@@ -205,6 +260,8 @@ fn run_session(settings: &Settings, connector: &Connector, led: &mut Led) -> Res
     // Streams the orchestrator opened that the worker has not finished yet.
     let mut pending: HashSet<u32> = HashSet::new();
     let mut last_ping = Instant::now();
+    let mut last_report = Instant::now();
+    let mut reported_bytes = 0u64;
 
     loop {
         if last_ping.elapsed() >= PING_INTERVAL {
@@ -213,15 +270,35 @@ fn run_session(settings: &Settings, connector: &Connector, led: &mut Led) -> Res
             last_ping = Instant::now();
         }
 
+        let mut moved = 0usize;
+
         while let Some(frame) = ws.poll_frame()? {
-            handle_frame(frame, &mut ws, connector, &mut streams, &mut pending)?;
+            moved += handle_frame(frame, &mut ws, connector, &mut streams, &mut pending)?;
         }
 
         collect_connections(connector, &mut ws, &mut streams, &mut pending)?;
-        relay_to_orchestrator(&mut ws, &mut streams)?;
+        moved += relay_to_orchestrator(&mut ws, &mut streams)?;
+
+        reported_bytes += moved as u64;
+        if last_report.elapsed() >= THROUGHPUT_REPORT {
+            let seconds = last_report.elapsed().as_secs_f32();
+            info!(
+                "relayed {:.1} KB in {:.0}s ({:.1} KB/s) across {} streams",
+                reported_bytes as f32 / 1024.0,
+                seconds,
+                reported_bytes as f32 / 1024.0 / seconds,
+                streams.len()
+            );
+            reported_bytes = 0;
+            last_report = Instant::now();
+        }
 
         set_activity_led(led, !streams.is_empty());
-        thread::sleep(POLL_INTERVAL);
+
+        // Yield only when idle, so bulk transfers run at link speed.
+        if moved == 0 {
+            thread::sleep(IDLE_BACKOFF);
+        }
     }
 }
 
@@ -235,17 +312,18 @@ fn read_frame_blocking<S: Read + Write>(ws: &mut WsConn<S>) -> Result<Frame> {
         if Instant::now() > deadline {
             return Err(anyhow!("timed out waiting for the orchestrator's reply"));
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(IDLE_BACKOFF);
     }
 }
 
+/// Act on one orchestrator frame, returning the bytes written to a target.
 fn handle_frame<S: Read + Write>(
     frame: Frame,
     ws: &mut WsConn<S>,
     connector: &Connector,
     streams: &mut HashMap<u32, TcpStream>,
     pending: &mut HashSet<u32>,
-) -> Result<()> {
+) -> Result<usize> {
     let stream_id = frame.stream_id;
 
     match frame.frame_type {
@@ -256,7 +334,7 @@ fn handle_frame<S: Read + Write>(
             if streams.len() + pending.len() >= MAX_CONCURRENT_STREAMS {
                 warn!("refusing stream {stream_id}: at the {MAX_CONCURRENT_STREAMS}-stream limit");
                 ws.send_frame(&Frame::error(stream_id, 1))?;
-                return Ok(());
+                return Ok(0);
             }
 
             // Resolve and connect happen on the worker thread; the ACK follows
@@ -271,7 +349,7 @@ fn handle_frame<S: Read + Write>(
 
         FrameType::Data => {
             if frame.payload.is_empty() {
-                return Ok(()); // Empty DATA is an ACK.
+                return Ok(0); // Empty DATA is an ACK.
             }
             match streams.get_mut(&stream_id) {
                 Some(stream) => {
@@ -281,6 +359,7 @@ fn handle_frame<S: Read + Write>(
                         ws.send_frame(&Frame::close(stream_id))?;
                     } else {
                         debug!("wrote {} bytes to stream {stream_id}", frame.payload.len());
+                        return Ok(frame.payload.len());
                     }
                 }
                 // Data for a stream still connecting has nowhere to go; the
@@ -305,7 +384,7 @@ fn handle_frame<S: Read + Write>(
         other => warn!("unexpected frame type: {other:?}"),
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// Adopt sockets the worker finished, and answer the orchestrator.
@@ -337,39 +416,55 @@ fn collect_connections<S: Read + Write>(
     Ok(())
 }
 
-/// Forward whatever the targets sent back.
+/// Forward whatever the targets sent back, returning the bytes relayed.
+///
+/// Each stream is drained until it blocks or hits its budget, rather than one
+/// buffer per pass: a single read per loop iteration made throughput a
+/// function of the loop interval instead of the link.
 fn relay_to_orchestrator<S: Read + Write>(
     ws: &mut WsConn<S>,
     streams: &mut HashMap<u32, TcpStream>,
-) -> Result<()> {
-    let mut buffer = [0u8; 4096];
+) -> Result<usize> {
+    let mut buffer = [0u8; RELAY_BUFFER];
     let mut finished = Vec::new();
+    let mut total = 0usize;
 
     for (&stream_id, stream) in streams.iter_mut() {
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                debug!("stream {stream_id} EOF");
-                ws.send_frame(&Frame::close(stream_id))?;
-                finished.push(stream_id);
-            }
-            Ok(n) => {
-                debug!("relaying {n} bytes from stream {stream_id}");
-                ws.send_frame(&Frame::data(stream_id, buffer[..n].to_vec().into()))?;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                error!("stream {stream_id} read failed: {e}");
-                ws.send_frame(&Frame::error(stream_id, 2))?;
-                finished.push(stream_id);
+        let mut from_stream = 0usize;
+
+        while from_stream < PER_STREAM_BUDGET {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    debug!("stream {stream_id} EOF");
+                    ws.send_frame(&Frame::close(stream_id))?;
+                    finished.push(stream_id);
+                    break;
+                }
+                Ok(n) => {
+                    ws.send_frame(&Frame::data(stream_id, buffer[..n].to_vec().into()))?;
+                    from_stream += n;
+                    if n < buffer.len() {
+                        break; // Drained for now.
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    error!("stream {stream_id} read failed: {e}");
+                    ws.send_frame(&Frame::error(stream_id, 2))?;
+                    finished.push(stream_id);
+                    break;
+                }
             }
         }
+
+        total += from_stream;
     }
 
     for stream_id in finished {
         streams.remove(&stream_id);
     }
 
-    Ok(())
+    Ok(total)
 }
 
 fn set_activity_led(led: &mut Led, active: bool) {
