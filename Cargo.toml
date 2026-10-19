@@ -20,6 +20,11 @@ log = "0.4"
 anyhow = "1.0"
 embedded-svc = "0.28"
 
+[features]
+# Measure raw network capacity at boot instead of trusting relay numbers.
+# Diagnostic builds only; production firmware never sends this traffic.
+netdiag = []
+
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
 

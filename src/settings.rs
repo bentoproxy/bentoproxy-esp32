@@ -24,6 +24,8 @@ const VALUE_BUF: usize = 256;
 pub const DEFAULT_ORCHESTRATOR_URL: &str = "wss://bentoproxy.com/ws/device";
 /// NVS key holding this unit's setup code.
 pub const SETUP_CODE_KEY: &str = "setup_code";
+/// NVS flag asking the next boot to open the setup portal.
+const PORTAL_KEY: &str = "portal_next";
 /// Characters for the setup code: 32 symbols, none of them easily misread off
 /// a printed label.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -137,6 +139,38 @@ impl Settings {
         nvs.set_str("device_token", device_token)?;
         info!("credentials stored for {device_id}");
         Ok(())
+    }
+
+    /// Ask the next boot to open the setup portal.
+    ///
+    /// Set when the saved WiFi cannot be joined — the node has moved, or the
+    /// router changed — so the owner can pick a new network. The portal runs
+    /// on a fresh boot rather than here because the radio is already
+    /// committed to station mode.
+    pub fn request_portal(partition: EspDefaultNvsPartition) -> Result<()> {
+        let mut nvs = EspNvs::new(partition, NAMESPACE, true)?;
+        nvs.set_u8(PORTAL_KEY, 1)?;
+        Ok(())
+    }
+
+    /// Whether the previous boot asked for the portal. Clears the request, so
+    /// a portal that times out falls back to retrying the saved network.
+    pub fn take_portal_request(partition: EspDefaultNvsPartition) -> Result<bool> {
+        let mut nvs = EspNvs::new(partition, NAMESPACE, true)?;
+        let requested = nvs.get_u8(PORTAL_KEY)?.unwrap_or(0) == 1;
+        if requested {
+            nvs.remove(PORTAL_KEY)?;
+        }
+        Ok(requested)
+    }
+
+    /// Whether this node has been claimed, for wording the setup page.
+    pub fn is_claimed(partition: EspDefaultNvsPartition) -> bool {
+        let Ok(mut nvs) = EspNvs::new(partition, NAMESPACE, true) else {
+            return false;
+        };
+        let mut buf = [0u8; 64];
+        matches!(nvs.get_str("device_id", &mut buf), Ok(Some(_)))
     }
 
     /// This unit's setup code, generated once and kept for the life of the

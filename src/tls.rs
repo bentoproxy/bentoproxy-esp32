@@ -41,6 +41,23 @@ impl TlsStream {
         Ok(Self { handle })
     }
 
+    /// The socket's descriptor, for waiting on it with select().
+    pub fn raw_fd(&self) -> Option<i32> {
+        let mut fd: i32 = -1;
+        let ok = unsafe { esp_idf_sys::esp_tls_get_conn_sockfd(self.handle, &mut fd) };
+        (ok == esp_idf_sys::ESP_OK && fd >= 0).then_some(fd)
+    }
+
+    /// Plaintext already decrypted and buffered inside the TLS layer.
+    ///
+    /// select() cannot see it: once mbedTLS has pulled a record off the
+    /// socket, the socket can be empty while data is ready. Anything waiting on
+    /// the socket must check this first or it can block with input pending.
+    pub fn pending(&self) -> usize {
+        let n = unsafe { esp_idf_sys::esp_tls_get_bytes_avail(self.handle) };
+        n.max(0) as usize
+    }
+
     /// Switch the underlying socket between blocking and non-blocking.
     pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
         unsafe {
@@ -77,7 +94,7 @@ impl Read for TlsStream {
             esp_idf_sys::esp_tls_conn_read(self.handle, buf.as_mut_ptr() as *mut _, buf.len())
         };
         if n < 0 {
-            Err(tls_io_error("read"))
+            Err(tls_io_error("read", n as i32))
         } else {
             Ok(n as usize)
         }
@@ -90,7 +107,7 @@ impl Write for TlsStream {
             esp_idf_sys::esp_tls_conn_write(self.handle, buf.as_ptr() as *const _, buf.len())
         };
         if n < 0 {
-            Err(tls_io_error("write"))
+            Err(tls_io_error("write", n as i32))
         } else {
             Ok(n as usize)
         }
@@ -107,13 +124,24 @@ impl Drop for TlsStream {
     }
 }
 
-// esp-tls reports "would block" through errno, as the socket layer does.
-fn tls_io_error(op: &str) -> std::io::Error {
-    let errno = unsafe { *esp_idf_sys::__errno() };
-    if errno == esp_idf_sys::EWOULDBLOCK as i32 || errno == esp_idf_sys::EAGAIN as i32 {
-        std::io::Error::new(std::io::ErrorKind::WouldBlock, "TLS would block")
-    } else {
-        std::io::Error::other(format!("TLS {op} error: errno {errno}"))
+/// Classify a negative esp-tls return by its code, not by errno.
+///
+/// Reading errno here was wrong: a failed TLS call can leave the code in its
+/// return value while errno still holds an EAGAIN from some earlier socket
+/// call. A real failure then looked like "try again", and the relay retried
+/// it until a 20s deadline killed the session — every ~30s once the loop
+/// polled fast enough to make stale values common.
+fn tls_io_error(op: &str, code: i32) -> std::io::Error {
+    match code {
+        esp_idf_sys::ESP_TLS_ERR_SSL_WANT_READ | esp_idf_sys::ESP_TLS_ERR_SSL_WANT_WRITE => {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "TLS would block")
+        }
+        // TLS 1.3 servers send session tickets after the handshake. mbedTLS
+        // reports one as its own code; it means "call again", not failure.
+        esp_idf_sys::MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET => {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "TLS session ticket received")
+        }
+        _ => std::io::Error::other(format!("TLS {op} failed: -0x{:04x}", code.unsigned_abs())),
     }
 }
 

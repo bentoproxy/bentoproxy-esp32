@@ -8,15 +8,20 @@
 
 mod claim;
 mod connect;
+#[cfg(feature = "netdiag")]
+mod diag;
 mod netfilter;
+mod profile;
 mod provisioning;
 mod settings;
 mod tls;
+mod wait;
 mod ws;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,18 +59,26 @@ const MAX_CONCURRENT_STREAMS: usize = 12;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WIFI_ATTEMPTS: u32 = 5;
+/// How long setup stays open after the saved network could not be joined,
+/// before rebooting to try that network again.
+const PORTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TLS_TIMEOUT_MS: u32 = 30_000;
-/// Backoff when there is nothing to do. Only applied on an idle pass: a busy
-/// pass loops straight back, because sleeping between every read used to cap a
-/// stream at one buffer per interval (~400 KB/s) regardless of link speed.
-const IDLE_BACKOFF: Duration = Duration::from_millis(10);
-/// Per-stream read buffer. A multiple of lwIP's 1440-byte MSS.
-const RELAY_BUFFER: usize = 8192;
+/// Longest an idle pass waits for socket activity. select() returns as soon
+/// as any socket is readable, so this only bounds how late we notice events
+/// that are not sockets: finished connects, and the ping timer.
+const IDLE_WAIT: Duration = Duration::from_millis(20);
+/// Per-stream read buffer, and so the largest relay frame.
+///
+/// Sized to fit one outgoing TLS record (16KB, see sdkconfig) after the
+/// WebSocket header and protocol framing, so each frame is encrypted and
+/// written once. Reads were filling an 8KB buffer every time, meaning data
+/// arrived faster than one buffer per read.
+const RELAY_BUFFER: usize = 16 * 1024 - 64;
 /// Bytes a single stream may move per pass, so one busy download cannot
 /// starve the other streams or delay the keep-alive ping.
 const PER_STREAM_BUDGET: usize = 32 * 1024;
 /// How often to log relayed throughput.
-const THROUGHPUT_REPORT: Duration = Duration::from_secs(60);
+const THROUGHPUT_REPORT: Duration = Duration::from_secs(15);
 /// Give up on a connection that has gone quiet.
 ///
 /// The orchestrator pings well inside this, so silence means the link is dead
@@ -94,13 +107,27 @@ fn main() -> ! {
         }
     }
 
+    // The last boot could not join its saved network: offer setup for a while
+    // so the owner can choose a new one, keeping the node's claim.
+    if Settings::take_portal_request(nvs.clone()).unwrap_or(false) {
+        let unreachable = Settings::load(nvs.clone())
+            .ok()
+            .flatten()
+            .map(|s| s.wifi_ssid);
+        info!("saved WiFi was unreachable; opening setup for {}s", PORTAL_TIMEOUT.as_secs());
+        match provisioning::run(peripherals.modem, sys_loop, nvs, Some(PORTAL_TIMEOUT), unreachable) {
+            Ok(()) => restart("setup window closed"),
+            Err(e) => restart(&format!("setup portal failed: {e:?}")),
+        }
+    }
+
     // Credentials come from NVS or from the build; a blank device opens its
     // own setup network instead.
     let settings = match Settings::load(nvs.clone()) {
         Ok(Some(settings)) => settings,
         Ok(None) => {
             info!("no settings stored; starting setup portal");
-            match provisioning::run(peripherals.modem, sys_loop, nvs) {
+            match provisioning::run(peripherals.modem, sys_loop, nvs, None, None) {
                 // Reboot so the normal path starts from a clean radio state
                 // rather than switching the interface out from under lwIP.
                 Ok(()) => restart("setup complete"),
@@ -111,16 +138,25 @@ fn main() -> ! {
     };
 
     let nvs_for_claim = nvs.clone();
+    let nvs_for_portal = nvs.clone();
     let mut wifi = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
         Ok(wifi) => wifi,
         Err(e) => restart(&format!("WiFi init failed: {e:?}")),
     };
 
     if let Err(e) = connect_wifi(&mut wifi, &settings) {
-        // A reboot retries from scratch, including a fresh DHCP lease, which
-        // beats sitting in a panicked state until someone power-cycles it.
-        restart(&format!("WiFi connection failed: {e:?}"));
+        // Retrying forever helps nobody if the node has moved: its saved
+        // network is simply not there. Reboot into setup instead, which times
+        // out and retries the saved network, so an outage recovers by itself.
+        warn!("could not join '{}': {e:?}", settings.wifi_ssid);
+        if let Err(e) = Settings::request_portal(nvs_for_portal) {
+            warn!("could not schedule setup: {e:?}");
+        }
+        restart("saved WiFi unreachable; opening setup on next boot");
     }
+
+    #[cfg(feature = "netdiag")]
+    diag::run();
 
     // Credentials arrive from a claim, not from the owner: the node announces
     // itself and waits for them to enter its setup code in the dashboard.
@@ -246,6 +282,20 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, settings: &Settings) 
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
             Ok(()) => {
                 info!("WiFi connected: {:?}", wifi.wifi().sta_netif().get_ip_info());
+
+                // IDF enables modem sleep by default: the radio dozes between
+                // beacons and every packet waits for it to wake. Right for a
+                // battery sensor, ruinous for a relay that is always moving
+                // data and always on mains power.
+                let result = unsafe {
+                    esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE)
+                };
+                if result == esp_idf_sys::ESP_OK {
+                    info!("WiFi power saving disabled");
+                } else {
+                    warn!("could not disable WiFi power saving: {result}");
+                }
+
                 return Ok(());
             }
             Err(e) => {
@@ -298,8 +348,14 @@ fn run_session(
     info!("Authenticated");
 
     ws.get_mut().set_nonblocking(true)?;
+    let tls_fd = ws.get_ref().raw_fd();
+    ws.set_wait_fd(tls_fd);
 
     let mut streams: HashMap<u32, TcpStream> = HashMap::new();
+    // On the heap, allocated once per session: as a stack array it can be
+    // inlined into a frame that is live during the TLS handshake, and the two
+    // together overflowed the main task's stack.
+    let mut relay_buffer = vec![0u8; RELAY_BUFFER];
     // Streams the orchestrator opened that the worker has not finished yet.
     let mut pending: HashSet<u32> = HashSet::new();
     let mut last_ping = Instant::now();
@@ -329,7 +385,7 @@ fn run_session(
         }
 
         collect_connections(connector, &mut ws, &mut streams, &mut pending)?;
-        moved += relay_to_orchestrator(&mut ws, &mut streams)?;
+        moved += relay_to_orchestrator(&mut ws, &mut streams, &mut relay_buffer)?;
 
         reported_bytes += moved as u64;
         if last_report.elapsed() >= THROUGHPUT_REPORT {
@@ -341,15 +397,37 @@ fn run_session(
                 reported_bytes as f32 / 1024.0 / seconds,
                 streams.len()
             );
+            info!("{}", profile::take_report(seconds));
+            // Heap margin, so buffer tuning shows its cost before it shows a
+            // crash. The minimum is the low-water mark since boot.
+            info!(
+                "heap: {} KB free, {} KB at lowest",
+                unsafe { esp_idf_sys::esp_get_free_heap_size() } / 1024,
+                unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() } / 1024
+            );
             reported_bytes = 0;
             last_report = Instant::now();
         }
 
         set_activity_led(led, !streams.is_empty());
 
-        // Yield only when idle, so bulk transfers run at link speed.
+        // Idle pass: wait for any socket to become readable rather than
+        // sleeping a fixed interval. Busy passes loop straight back.
         if moved == 0 {
-            thread::sleep(IDLE_BACKOFF);
+            profile::idle_sleep();
+
+            // Plaintext already inside TLS is invisible to select(); with some
+            // waiting, go straight round again.
+            if ws.get_ref().pending() == 0 {
+                let mut readable = wait::FdSet::new();
+                if let Some(fd) = tls_fd {
+                    readable.add(fd);
+                }
+                for stream in streams.values() {
+                    readable.add(stream.as_raw_fd());
+                }
+                wait::wait(readable, wait::FdSet::new(), IDLE_WAIT);
+            }
         }
     }
 }
@@ -364,7 +442,7 @@ fn read_frame_blocking<S: Read + Write>(ws: &mut WsConn<S>) -> Result<Frame> {
         if Instant::now() > deadline {
             return Err(anyhow!("timed out waiting for the orchestrator's reply"));
         }
-        thread::sleep(IDLE_BACKOFF);
+        thread::sleep(IDLE_WAIT);
     }
 }
 
@@ -476,8 +554,8 @@ fn collect_connections<S: Read + Write>(
 fn relay_to_orchestrator<S: Read + Write>(
     ws: &mut WsConn<S>,
     streams: &mut HashMap<u32, TcpStream>,
+    buffer: &mut [u8],
 ) -> Result<usize> {
-    let mut buffer = [0u8; RELAY_BUFFER];
     let mut finished = Vec::new();
     let mut total = 0usize;
 
@@ -485,7 +563,12 @@ fn relay_to_orchestrator<S: Read + Write>(
         let mut from_stream = 0usize;
 
         while from_stream < PER_STREAM_BUDGET {
-            match stream.read(&mut buffer) {
+            let read_started = Instant::now();
+            let result = stream.read(buffer);
+            if let Ok(n) = result {
+                profile::read_done(read_started, n);
+            }
+            match result {
                 Ok(0) => {
                     debug!("stream {stream_id} EOF");
                     ws.send_frame(&Frame::close(stream_id))?;
@@ -493,7 +576,8 @@ fn relay_to_orchestrator<S: Read + Write>(
                     break;
                 }
                 Ok(n) => {
-                    ws.send_frame(&Frame::data(stream_id, buffer[..n].to_vec().into()))?;
+                    // Straight from the read buffer: no per-frame allocation.
+                    ws.send_data(stream_id, &buffer[..n])?;
                     from_stream += n;
                     if n < buffer.len() {
                         break; // Drained for now.

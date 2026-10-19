@@ -1,9 +1,13 @@
-# Increase main task stack size to prevent overflow (TLS needs lots of stack)
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# Main task stack. The TLS handshake (mbedTLS plus certificate-bundle
+# verification) is stack-hungry and runs on this task, and with LTO the
+# compiler can inline large buffers into main()'s frame, which never unwinds.
+# 16KB overflowed in practice; the S3 has ~290KB of heap, so be generous.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
-# WiFi configuration
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+# WiFi receive buffers. Sized to back the block-ack window below: the window
+# cannot usefully exceed the buffers available to hold what it lets in.
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 
 # Enable WiFi
 CONFIG_ESP_WIFI_ENABLED=y
@@ -32,3 +36,23 @@ CONFIG_MBEDTLS_HARDWARE_SHA=y
 # Socket table: the relay's stream limit plus the orchestrator connection and
 # DNS. IDF defaults to 10, which caps the node at 8 relayed streams.
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# Block-ack (AMPDU) windows: how many frames may be aggregated before an
+# acknowledgement. IDF's default of 6 kept the router sending in short bursts
+# and waiting; the relay sat idle most of the time while its sockets drained.
+# 16 rather than Espressif's 32 keeps buffer memory within the S3's headroom.
+CONFIG_ESP_WIFI_RX_BA_WIN=16
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+
+# CPU at its full 240MHz rather than the 160MHz default. Once the WiFi
+# aggregation window stopped starving the relay, writing to the orchestrator
+# became the bottleneck, and every relayed byte is masked and TLS-encrypted on
+# this core.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Outgoing TLS record size. IDF caps outgoing records at 4KB (incoming stay at
+# 16KB), so every 8KB relay frame left as two separately encrypted records and
+# two socket writes, each able to stall. Once uploading to the orchestrator
+# became the bottleneck, that doubled the work on the critical path.
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384

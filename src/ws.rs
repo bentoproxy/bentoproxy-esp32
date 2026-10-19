@@ -22,6 +22,11 @@ const OP_PONG: u8 = 0xA;
 /// Payload cap for a single message. The orchestrator never sends more, and
 /// without a limit a bad length prefix would try to allocate past free heap.
 const MAX_PAYLOAD: usize = 64 * 1024;
+/// Outgoing buffer reserved once per connection: one 16KB relay frame plus
+/// the protocol and WebSocket headers.
+const TX_CAPACITY: usize = 16 * 1024 + 64;
+/// bentoproxy-protocol frame header: type, flags, stream id, payload length.
+const PROTOCOL_HEADER: usize = 10;
 
 /// A WebSocket client connection.
 pub struct WsConn<S> {
@@ -33,7 +38,11 @@ pub struct WsConn<S> {
     /// Reused outgoing frame buffer: the relay sends thousands of frames a
     /// second under load, and a fresh allocation per frame fragments the heap.
     tx: Vec<u8>,
-    scratch: [u8; 2048],
+    /// Heap, not an array: this struct lives on the main task's stack.
+    scratch: Vec<u8>,
+    /// Descriptor to wait on when a write would block; None falls back to
+    /// sleeping, for streams without one.
+    wait_fd: Option<i32>,
 }
 
 impl<S: Read + Write> WsConn<S> {
@@ -99,8 +108,12 @@ impl<S: Read + Write> WsConn<S> {
             stream,
             rx: Vec::with_capacity(4096),
             fragment: Vec::new(),
-            tx: Vec::with_capacity(8192 + 14),
-            scratch: [0u8; 2048],
+            // Sized up front for the largest relay frame, while the heap is
+            // fresh after the handshake. Growing it later can fail once WiFi
+            // buffers have fragmented the heap.
+            tx: Vec::with_capacity(TX_CAPACITY),
+            scratch: vec![0u8; 2048],
+            wait_fd: None,
         })
     }
 
@@ -137,9 +150,35 @@ impl<S: Read + Write> WsConn<S> {
         &mut self.stream
     }
 
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    /// Let blocked writes wait on this descriptor instead of sleeping.
+    pub fn set_wait_fd(&mut self, fd: Option<i32>) {
+        self.wait_fd = fd;
+    }
+
     /// Send a protocol frame as one masked binary message.
     pub fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         self.send_message(OP_BINARY, &frame.to_bytes())
+    }
+
+    /// Send relayed bytes as a DATA frame without copying them anywhere first.
+    ///
+    /// The general path builds a Frame (one copy), serialises it (a second)
+    /// and masks it into the send buffer (a third), each a fresh heap
+    /// allocation the size of the payload. On the hot path that churned the
+    /// heap until a 16KB allocation failed with 160KB nominally free. Here the
+    /// protocol header and payload are masked straight into the reused buffer.
+    pub fn send_data(&mut self, stream_id: u32, payload: &[u8]) -> Result<()> {
+        let mut header = [0u8; PROTOCOL_HEADER];
+        header[0] = bentoproxy_protocol::FrameType::Data as u8;
+        header[1] = 0; // no flags
+        header[2..6].copy_from_slice(&stream_id.to_le_bytes());
+        header[6..10].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        self.send_parts(OP_BINARY, &header, payload)
     }
 
     fn send_control(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
@@ -147,15 +186,21 @@ impl<S: Read + Write> WsConn<S> {
     }
 
     fn send_message(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
+        self.send_parts(opcode, &[], payload)
+    }
+
+    /// Write one masked message whose payload is `head` followed by `body`,
+    /// so callers can prepend a header without concatenating first.
+    fn send_parts(&mut self, opcode: u8, head: &[u8], body: &[u8]) -> Result<()> {
         // Split the borrow so the reusable buffer and the stream can be held
         // at once.
-        let Self { stream, tx, .. } = self;
+        let Self { stream, tx, wait_fd, .. } = self;
 
         tx.clear();
         tx.push(0x80 | opcode); // FIN + opcode
 
         // RFC 6455: every client frame is masked.
-        let len = payload.len();
+        let len = head.len() + body.len();
         if len < 126 {
             tx.push(0x80 | len as u8);
         } else if len < 65536 {
@@ -168,12 +213,20 @@ impl<S: Read + Write> WsConn<S> {
 
         let mask = random_bytes();
         tx.extend_from_slice(&mask);
-        tx.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        // The mask runs continuously across header and body.
+        tx.extend(
+            head.iter()
+                .chain(body.iter())
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % 4]),
+        );
 
         // One write for header and payload together: two writes per frame put
         // a small packet on the wire ahead of each payload.
-        write_all_nonblocking(stream, tx)?;
+        let started = std::time::Instant::now();
+        write_all_nonblocking(stream, tx, *wait_fd)?;
         stream.flush()?;
+        crate::profile::write_done(started);
         Ok(())
     }
 
@@ -296,7 +349,11 @@ fn parse_frame(buf: &[u8]) -> Result<Option<(bool, u8, Vec<u8>, usize)>> {
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Write every byte, yielding briefly when the socket is full.
-fn write_all_nonblocking<W: Write>(stream: &mut W, mut buf: &[u8]) -> Result<()> {
+fn write_all_nonblocking<W: Write>(
+    stream: &mut W,
+    mut buf: &[u8],
+    wait_fd: Option<i32>,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
 
     while !buf.is_empty() {
@@ -304,13 +361,26 @@ fn write_all_nonblocking<W: Write>(stream: &mut W, mut buf: &[u8]) -> Result<()>
             Ok(0) => return Err(anyhow!("write returned 0 bytes")),
             Ok(n) => buf = &buf[n..],
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                crate::profile::write_stalled();
                 if std::time::Instant::now() > deadline {
                     return Err(anyhow!(
                         "socket accepted nothing for {}s; treating the link as dead",
                         WRITE_TIMEOUT.as_secs()
                     ));
                 }
-                std::thread::sleep(std::time::Duration::from_micros(500));
+                // Wait for the socket rather than sleeping a whole scheduler
+                // tick. TLS can need to read before it can write (WANT_READ),
+                // so wake on either direction.
+                match wait_fd {
+                    Some(fd) => {
+                        let mut read = crate::wait::FdSet::new();
+                        let mut write = crate::wait::FdSet::new();
+                        read.add(fd);
+                        write.add(fd);
+                        crate::wait::wait(read, write, std::time::Duration::from_millis(50));
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
             }
             Err(e) => return Err(e.into()),
         }

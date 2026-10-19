@@ -32,14 +32,22 @@ const PORTAL_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
 /// Body cap for the save request; the form is far smaller.
 const MAX_BODY: usize = 1024;
 
-/// Run setup until credentials arrive. Returns once they are stored.
+/// Run setup until new WiFi details arrive, or until `timeout` passes.
+///
+/// A first-time setup waits indefinitely. A node that lost its saved network
+/// waits only `timeout`, then returns so the caller can reboot and retry the
+/// old network: a router reboot must not strand a node in setup mode, while a
+/// node that really moved keeps offering setup on every cycle.
 pub fn run(
     modem: impl esp_idf_hal::peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
+    timeout: Option<Duration>,
+    unreachable_network: Option<String>,
 ) -> Result<()> {
     let ap_ssid = ap_name()?;
     let setup_code = Settings::setup_code(nvs.clone())?;
+    let claimed = Settings::is_claimed(nvs.clone());
 
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(modem, sys_loop.clone(), Some(nvs.clone()))?,
@@ -81,12 +89,20 @@ pub fn run(
         saved.clone(),
         ap_ssid.clone(),
         setup_code.clone(),
+        claimed,
+        unreachable_network,
     )?;
     let _dns = redirect_dns();
+
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
     // Rescan periodically: a customer may switch their router's band or move
     // the node while this page is open.
     while !saved.load(Ordering::Relaxed) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            info!("setup timed out; retrying the saved network");
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_secs(15));
         if !saved.load(Ordering::Relaxed) {
             let fresh = scan(&mut wifi);
@@ -145,6 +161,8 @@ fn serve(
     saved: Arc<AtomicBool>,
     ap_ssid: String,
     setup_code: String,
+    claimed: bool,
+    unreachable_network: Option<String>,
 ) -> Result<EspHttpServer<'static>> {
     // The default 6KB handler stack leaves little room for building a page
     // and holding the request body at once.
@@ -158,7 +176,10 @@ fn serve(
     server.fn_handler("/", Method::Get, move |req| {
         let list = page_networks.lock().map(|l| l.clone()).unwrap_or_default();
         let mut response = req.into_ok_response()?;
-        response.write_all(setup_page(&list, &ap_ssid, &page_code).as_bytes())?;
+        response.write_all(
+            setup_page(&list, &ap_ssid, &page_code, claimed, unreachable_network.as_deref())
+                .as_bytes(),
+        )?;
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -353,8 +374,34 @@ fn dns_reply(query: &[u8]) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-fn setup_page(networks: &[(String, i8)], ap_ssid: &str, setup_code: &str) -> String {
+fn setup_page(
+    networks: &[(String, i8)],
+    ap_ssid: &str,
+    setup_code: &str,
+    claimed: bool,
+    unreachable_network: Option<&str>,
+) -> String {
     let default_url = crate::settings::DEFAULT_ORCHESTRATOR_URL;
+
+    // A node that moved has nothing to claim, only a network to change.
+    let lost_notice = match unreachable_network {
+        Some(ssid) => format!(
+            "<p class=\"note\">This node could not connect to <strong>{}</strong>. \
+             Choose the network it should use now.</p>",
+            escape(ssid)
+        ),
+        None => String::new(),
+    };
+    let next_step = if claimed {
+        "This node is already linked to your account — once it joins the network \
+         it reconnects by itself."
+            .to_string()
+    } else {
+        format!(
+            "Next you will enter this node's setup code <strong>{setup_code}</strong> in \
+             your BentoProxy dashboard to link it to your account."
+        )
+    };
     let options = if networks.is_empty() {
         "<option value=\"\">No networks found — wait a moment and reload</option>".to_string()
     } else {
@@ -397,6 +444,7 @@ fn setup_page(networks: &[(String, i8)], ap_ssid: &str, setup_code: &str) -> Str
 <body>
   <h1>Set up your node</h1>
   <p class="sub">{ap_ssid}</p>
+  {lost_notice}
   <form method="POST" action="/save">
     <label for="ssid">WiFi network</label>
     <select id="ssid" name="ssid" required>{options}</select>
@@ -413,9 +461,8 @@ fn setup_page(networks: &[(String, i8)], ap_ssid: &str, setup_code: &str) -> Str
 
     <button type="submit">Save and connect</button>
   </form>
-  <p class="note">Next you will enter this node's setup code
-  <strong>{setup_code}</strong> in your BentoProxy dashboard to link it to your
-  account. Only 2.4 GHz networks appear above: this node has no 5 GHz radio.</p>
+  <p class="note">{next_step} Only 2.4 GHz networks appear above: this node has no
+  5 GHz radio.</p>
 </body></html>"#
     )
 }

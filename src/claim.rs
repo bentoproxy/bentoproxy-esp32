@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
-use esp_idf_svc::io::{Read, Write};
+use esp_idf_svc::io::Write;
 use log::{info, warn};
 
 /// Model string shown in the dashboard beside a waiting node.
