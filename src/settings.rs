@@ -17,7 +17,11 @@ pub const NAMESPACE: &str = "bentoproxy";
 const VALUE_BUF: usize = 256;
 
 /// Where to reach the orchestrator when the owner did not say otherwise.
-pub const DEFAULT_ORCHESTRATOR_URL: &str = "wss://bentoproxy.com:8443/ws/device";
+///
+/// Port 443, not 8443: both reach the same route, but guest, hotel and
+/// corporate networks routinely allow only 443 outbound. A node on a guest
+/// network was being reset every couple of minutes on 8443.
+pub const DEFAULT_ORCHESTRATOR_URL: &str = "wss://bentoproxy.com/ws/device";
 /// NVS key holding this unit's setup code.
 pub const SETUP_CODE_KEY: &str = "setup_code";
 /// Characters for the setup code: 32 symbols, none of them easily misread off
@@ -59,7 +63,15 @@ impl Settings {
     pub fn load(partition: EspDefaultNvsPartition) -> Result<Option<Self>> {
         let mut nvs = EspNvs::new(partition, NAMESPACE, true)?;
 
-        if let Some(stored) = Self::from_nvs(&mut nvs)? {
+        if let Some(mut stored) = Self::from_nvs(&mut nvs)? {
+            // Nodes provisioned before the move to 443 carry the old port in
+            // NVS; re-point them rather than making the owner redo setup.
+            if stored.orchestrator_url.contains(":8443") {
+                info!("migrating the stored orchestrator URL to port 443");
+                stored.orchestrator_url = DEFAULT_ORCHESTRATOR_URL.to_string();
+                nvs.set_str("orch_url", DEFAULT_ORCHESTRATOR_URL)?;
+            }
+
             match stored.device_id.as_deref() {
                 Some(device_id) => info!("settings loaded from NVS (device {device_id})"),
                 None => info!("WiFi settings loaded from NVS; this node is not claimed yet"),
