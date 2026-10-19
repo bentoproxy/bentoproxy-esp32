@@ -28,3 +28,7 @@ CONFIG_ESP_WIFI_RX_IRAM_OPT=y
 # Use the hardware crypto blocks for TLS rather than software implementations.
 CONFIG_MBEDTLS_HARDWARE_AES=y
 CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+# Socket table: the relay's stream limit plus the orchestrator connection and
+# DNS. IDF defaults to 10, which caps the node at 8 relayed streams.
+CONFIG_LWIP_MAX_SOCKETS=16

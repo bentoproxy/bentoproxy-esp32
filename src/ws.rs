@@ -287,13 +287,29 @@ fn parse_frame(buf: &[u8]) -> Result<Option<(bool, u8, Vec<u8>, usize)>> {
     Ok(Some((fin, opcode, payload, offset + payload_len)))
 }
 
+/// How long to keep retrying a blocked write before calling the link dead.
+///
+/// A half-open connection — the far side gone, a NAT entry dropped by a guest
+/// network — leaves writes returning WouldBlock forever with no error. Without
+/// a deadline the relay spins here and the node never reconnects: it vanishes
+/// from the orchestrator until someone power-cycles it.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Write every byte, yielding briefly when the socket is full.
 fn write_all_nonblocking<W: Write>(stream: &mut W, mut buf: &[u8]) -> Result<()> {
+    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
+
     while !buf.is_empty() {
         match stream.write(buf) {
             Ok(0) => return Err(anyhow!("write returned 0 bytes")),
             Ok(n) => buf = &buf[n..],
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline {
+                    return Err(anyhow!(
+                        "socket accepted nothing for {}s; treating the link as dead",
+                        WRITE_TIMEOUT.as_secs()
+                    ));
+                }
                 std::thread::sleep(std::time::Duration::from_micros(500));
             }
             Err(e) => return Err(e.into()),

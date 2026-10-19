@@ -43,9 +43,14 @@ use settings::Settings;
 use tls::TlsStream;
 use ws::WsConn;
 
-/// Concurrent relayed streams. Each one costs a socket and lwIP buffers, so
-/// this is bounded by RAM rather than by policy.
-const MAX_CONCURRENT_STREAMS: usize = 8;
+/// Concurrent relayed streams. Each costs a socket and lwIP buffers, so the
+/// ceiling is lwIP's socket table (CONFIG_LWIP_MAX_SOCKETS) minus the
+/// orchestrator connection and room for DNS.
+///
+/// Deliberately higher than the capacity the orchestrator routes against: the
+/// spare slots absorb bursts and leave room for an owner-triggered speed test,
+/// which a node saturated with relayed traffic would otherwise refuse.
+const MAX_CONCURRENT_STREAMS: usize = 12;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WIFI_ATTEMPTS: u32 = 5;
@@ -61,6 +66,12 @@ const RELAY_BUFFER: usize = 8192;
 const PER_STREAM_BUDGET: usize = 32 * 1024;
 /// How often to log relayed throughput.
 const THROUGHPUT_REPORT: Duration = Duration::from_secs(60);
+/// Give up on a connection that has gone quiet.
+///
+/// The orchestrator pings well inside this, so silence means the link is dead
+/// even though the socket still looks open — which is how a node disappears
+/// and stays gone until someone reboots it.
+const INBOUND_TIMEOUT: Duration = Duration::from_secs(120);
 
 type Led = PinDriver<'static, esp_idf_hal::gpio::Gpio2, Output>;
 
@@ -293,6 +304,7 @@ fn run_session(
     let mut pending: HashSet<u32> = HashSet::new();
     let mut last_ping = Instant::now();
     let mut last_report = Instant::now();
+    let mut last_inbound = Instant::now();
     let mut reported_bytes = 0u64;
 
     loop {
@@ -305,7 +317,15 @@ fn run_session(
         let mut moved = 0usize;
 
         while let Some(frame) = ws.poll_frame()? {
+            last_inbound = Instant::now();
             moved += handle_frame(frame, &mut ws, connector, &mut streams, &mut pending)?;
+        }
+
+        if last_inbound.elapsed() >= INBOUND_TIMEOUT {
+            return Err(anyhow!(
+                "nothing from the orchestrator in {}s; reconnecting",
+                INBOUND_TIMEOUT.as_secs()
+            ));
         }
 
         collect_connections(connector, &mut ws, &mut streams, &mut pending)?;
