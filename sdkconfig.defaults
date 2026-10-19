@@ -14,9 +14,23 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 # Enable WiFi
 CONFIG_ESP_WIFI_ENABLED=y
 
-# Use single factory app partition but larger
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# The board's real flash size. IDF assumes 2MB otherwise, which cannot hold
+# two 3MB app slots. DIO: this board's flash does not boot in QIO.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# Two app slots for over-the-air updates; see partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+# Resolved relative to the IDF build directory, which esp-idf-sys places at
+# target/<triple>/<profile>/build/esp-idf-sys-<hash>/out: six levels below
+# the repository root, where partitions.csv lives.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"
+
+# A freshly updated image boots on probation. The firmware confirms it only
+# after authenticating with the orchestrator; if it crashes, hangs (see the
+# watchdog) or reboots first, the bootloader returns to the previous image.
+# Needs the bootloader built from this config, not espflash's bundled one.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Throughput tuning. The relay is a pure forwarder, so TCP window and WiFi
 # buffer sizes set the ceiling; IDF's defaults are sized for small sensor

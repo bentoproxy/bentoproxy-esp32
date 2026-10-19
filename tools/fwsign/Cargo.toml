@@ -1,0 +1,14 @@
+[package]
+name = "fwsign"
+version = "0.1.0"
+edition = "2021"
+description = "Signs bentoproxy node firmware for over-the-air updates"
+publish = false
+
+# A host tool, not firmware: keep it out of the parent's xtensa build.
+[workspace]
+
+[dependencies]
+ed25519-compact = { version = "2", features = ["random"] }
+sha2 = "0.10"
+anyhow = "1"

@@ -109,10 +109,12 @@ pub fn api_base_from_ws_url(ws_url: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}"))
 }
 
-fn client() -> Result<Client<EspHttpConnection>> {
+/// HTTPS client validating against the bundled root certificates. Shared with
+/// the update check.
+pub(crate) fn http_client(timeout: Duration) -> Result<Client<EspHttpConnection>> {
     let connection = EspHttpConnection::new(&HttpConfiguration {
         crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
-        timeout: Some(HTTP_TIMEOUT),
+        timeout: Some(timeout),
         ..Default::default()
     })?;
 
@@ -132,7 +134,7 @@ fn announce(url: &str, hw_id: &str, setup_code: &str) -> Result<()> {
         ("Content-Length", length.as_str()),
     ];
 
-    let mut client = client()?;
+    let mut client = http_client(HTTP_TIMEOUT)?;
     let mut request = client.post(url, &headers)?;
     request.write_all(body.as_bytes())?;
     request.flush()?;
@@ -147,7 +149,7 @@ fn announce(url: &str, hw_id: &str, setup_code: &str) -> Result<()> {
 }
 
 fn poll(url: &str) -> Result<Option<Credentials>> {
-    let mut client = client()?;
+    let mut client = http_client(HTTP_TIMEOUT)?;
     let request = client.get(url)?;
     let mut response = request.submit()?;
 
@@ -177,7 +179,7 @@ fn poll(url: &str) -> Result<Option<Credentials>> {
 ///
 /// The responses are a fixed handful of string fields, so this avoids pulling
 /// a JSON parser into the firmware.
-fn json_string(body: &str, key: &str) -> Option<String> {
+pub(crate) fn json_string(body: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let after_key = &body[body.find(&needle)? + needle.len()..];
     let after_colon = &after_key[after_key.find(':')? + 1..];

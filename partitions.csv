@@ -1,4 +1,13 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x1F0000,
+# Name,   Type, SubType, Offset,   Size,     Flags
+#
+# Two app slots for over-the-air updates: the running image stays intact
+# while the next one is written, and the bootloader can roll back to it.
+#
+# NVS must stay at 0x9000 with the same size: it holds WiFi settings, the
+# device's claimed credentials and its printed setup code, and moving it
+# would wipe them on every node that takes this layout.
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x300000,
+ota_1,    app,  ota_1,   0x320000, 0x300000,

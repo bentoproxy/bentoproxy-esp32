@@ -11,6 +11,7 @@ mod connect;
 #[cfg(feature = "netdiag")]
 mod diag;
 mod netfilter;
+mod ota;
 mod profile;
 mod provisioning;
 mod settings;
@@ -66,6 +67,10 @@ const ROUTABLE_STREAMS: u16 = 8;
 /// deadline), so it only fires on a real hang.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(45);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// How often a running node looks for a firmware update. It also checks at
+/// every boot. The check ends the relay session briefly: downloading needs a
+/// second TLS connection, and the heap cannot hold two under load.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WIFI_ATTEMPTS: u32 = 5;
 const WIFI_ATTEMPTS_NOT_VISIBLE: u32 = 2;
@@ -97,6 +102,9 @@ const THROUGHPUT_REPORT: Duration = Duration::from_secs(15);
 /// even though the socket still looks open — which is how a node disappears
 /// and stays gone until someone reboots it.
 const INBOUND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether this boot has confirmed its image yet (see ota::confirm_running).
+static IMAGE_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Led = PinDriver<'static, esp_idf_hal::gpio::Gpio2, Output>;
 
@@ -151,6 +159,7 @@ fn main() -> ! {
 
     let nvs_for_claim = nvs.clone();
     let nvs_for_portal = nvs.clone();
+    let nvs_for_ota = nvs.clone();
     let (mut wifi, network_visible) = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
         Ok(result) => result,
         Err(e) => restart(&format!("WiFi init failed: {e:?}")),
@@ -185,6 +194,14 @@ fn main() -> ! {
     };
 
     info!("Device ID: {}", credentials.0);
+    info!("Firmware version: {}", ota::firmware_version());
+
+    // Before relaying anything: a node that is already out of date should not
+    // spend a session on the old firmware, and the heap is at its emptiest.
+    let api_base = claim::api_base_from_ws_url(&settings.orchestrator_url).unwrap_or_default();
+    ota::reconcile_after_boot(nvs_for_ota.clone());
+    check_for_update(&api_base, nvs_for_ota.clone());
+    let mut last_update_check = Instant::now();
 
     let mut led = PinDriver::output(peripherals.pins.gpio2).unwrap();
     led.set_low().ok();
@@ -208,12 +225,27 @@ fn main() -> ! {
     loop {
         info!("Connecting to orchestrator: {}", settings.orchestrator_url);
 
-        match run_session(&settings, &credentials, &connector, &mut led, &mut watchdog) {
+        let session_deadline = last_update_check + UPDATE_CHECK_INTERVAL;
+        match run_session(
+            &settings,
+            &credentials,
+            &connector,
+            &mut led,
+            &mut watchdog,
+            session_deadline,
+            nvs_for_ota.clone(),
+        ) {
             Ok(()) => info!("Orchestrator connection closed"),
             Err(e) => error!("Session ended: {e:?}"),
         }
 
         led.set_low().ok();
+
+        if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+            check_for_update(&api_base, nvs_for_ota.clone());
+            last_update_check = Instant::now();
+        }
+
         warn!("Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
         thread::sleep(RECONNECT_DELAY);
     }
@@ -244,6 +276,22 @@ fn boot_button_held(pin: esp_idf_hal::gpio::Gpio0) -> bool {
     }
 
     true
+}
+
+/// Install a newer verified release if there is one, rebooting into it.
+/// Failures are logged and the node carries on with what it runs: a broken
+/// update server must never take nodes offline.
+fn check_for_update(api_base: &str, nvs: NvsPartition) {
+    if api_base.is_empty() {
+        return;
+    }
+    match ota::check_and_install(api_base, nvs) {
+        Ok(ota::Outcome::Installed { version }) => {
+            restart(&format!("rebooting into firmware {version}"));
+        }
+        Ok(ota::Outcome::UpToDate) => {}
+        Err(e) => warn!("update check failed: {e:?}"),
+    }
 }
 
 /// Log the reason and reboot. Returns never, so callers can use it in place
@@ -395,7 +443,12 @@ fn run_session(
     connector: &Connector,
     led: &mut Led,
     watchdog: &mut TWDTDriver<'_>,
+    deadline: Instant,
+    nvs: NvsPartition,
 ) -> Result<()> {
+    #[cfg(feature = "ota-crash-test")]
+    panic!("ota-crash-test: crashing before authentication on purpose");
+
     let (host, port, path) = parse_url(&settings.orchestrator_url)?;
 
     let mut tls = TlsStream::connect(host, port, TLS_TIMEOUT_MS)?;
@@ -422,6 +475,12 @@ fn run_session(
     }
     info!("Authenticated");
 
+    // Reaching the orchestrator is what proves a new image: confirm it, or
+    // the bootloader would roll back to the previous one on the next reset.
+    if !IMAGE_CONFIRMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        ota::confirm_running(nvs);
+    }
+
     ws.get_mut().set_nonblocking(true)?;
     let tls_fd = ws.get_ref().raw_fd();
     ws.set_wait_fd(tls_fd);
@@ -447,6 +506,11 @@ fn run_session(
     let selftest_started = Instant::now();
 
     loop {
+        if Instant::now() >= deadline {
+            info!("ending the session for the scheduled update check");
+            return Ok(());
+        }
+
         // Once a second is ample against a 45s timeout. Feeding on every
         // pass took the watchdog's lock thousands of times a second under
         // load.

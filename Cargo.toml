@@ -20,6 +20,10 @@ log = "0.4"
 anyhow = "1.0"
 embedded-svc = "0.28"
 
+# Firmware update verification: SHA-256 of the image, Ed25519 signature.
+sha2 = { version = "0.10", default-features = false }
+ed25519-compact = { version = "2", default-features = false }
+
 [features]
 # Measure raw network capacity at boot instead of trusting relay numbers.
 # Diagnostic builds only; production firmware never sends this traffic.
@@ -27,6 +31,9 @@ netdiag = []
 # Hang the relay loop on purpose once relaying, to prove the watchdog reboots
 # the node. Test builds only.
 wdt-selftest = []
+# Crash before reaching the orchestrator, to prove a bad release is rolled
+# back and not retried. Test releases only.
+ota-crash-test = []
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

@@ -24,3 +24,6 @@ Thumbs.db
 # Flash dumps
 *.bin
 *.elf
+
+# Host tools build for the host, not the board.
+tools/fwsign/target
