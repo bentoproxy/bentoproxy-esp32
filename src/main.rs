@@ -118,14 +118,9 @@ fn main() -> ! {
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    // Holding BOOT at power-on returns the node to setup, for resale or a
-    // changed router.
-    if boot_button_held(peripherals.pins.gpio0) {
-        match Settings::erase(nvs.clone()) {
-            Ok(()) => restart("factory reset requested"),
-            Err(e) => restart(&format!("factory reset failed: {e:?}")),
-        }
-    }
+    // Holding BOOT for 10s while running returns the node to setup, for
+    // resale or a changed router.
+    watch_reset_button(peripherals.pins.gpio0, nvs.clone());
 
     // The last boot could not join its saved network: offer setup for a while
     // so the owner can choose a new one, keeping the node's claim.
@@ -251,31 +246,47 @@ fn main() -> ! {
     }
 }
 
-/// Is the BOOT button held down? Checked once at startup, so a later press
-/// cannot wipe a working node by accident.
-fn boot_button_held(pin: esp_idf_hal::gpio::Gpio0) -> bool {
-    const HOLD: Duration = Duration::from_secs(3);
+/// Watch the BOOT button for a factory reset: held for 10s at any time.
+///
+/// Not at power-on: BOOT is the chip's strapping pin, and holding it while
+/// powering up starts the ROM's flashing mode instead of this firmware. Ten
+/// seconds is long enough that a brush against the button wipes nothing.
+fn watch_reset_button(pin: esp_idf_hal::gpio::Gpio0, nvs: EspDefaultNvsPartition) {
+    const HOLD: Duration = Duration::from_secs(10);
+    const POLL: Duration = Duration::from_millis(100);
 
     let Ok(button) = esp_idf_hal::gpio::PinDriver::input(pin) else {
-        return false;
+        warn!("BOOT button unavailable; factory reset disabled");
+        return;
     };
 
-    // The BOOT button pulls the pin low.
-    if button.is_high() {
-        return false;
+    let spawned = thread::Builder::new()
+        .name("reset-button".into())
+        .stack_size(4096)
+        .spawn(move || {
+            let mut pressed_since: Option<Instant> = None;
+            loop {
+                // The BOOT button pulls the pin low.
+                if button.is_low() {
+                    let since = *pressed_since.get_or_insert_with(|| {
+                        info!("BOOT pressed; hold {}s for a factory reset", HOLD.as_secs());
+                        Instant::now()
+                    });
+                    if since.elapsed() >= HOLD {
+                        match Settings::erase(nvs.clone()) {
+                            Ok(()) => restart("factory reset requested"),
+                            Err(e) => restart(&format!("factory reset failed: {e:?}")),
+                        }
+                    }
+                } else if pressed_since.take().is_some() {
+                    info!("BOOT released early; no reset");
+                }
+                thread::sleep(POLL);
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("could not watch the BOOT button: {e:?}");
     }
-
-    info!("BOOT held; keep holding {}s for a factory reset", HOLD.as_secs());
-    let deadline = Instant::now() + HOLD;
-    while Instant::now() < deadline {
-        if button.is_high() {
-            info!("BOOT released; continuing normal startup");
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    true
 }
 
 /// Install a newer verified release if there is one, rebooting into it.
