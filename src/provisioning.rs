@@ -73,6 +73,10 @@ pub fn run(
         },
     ))?;
     wifi.start()?;
+    if let Err(e) = advertise_dns(&mut wifi) {
+        warn!("phones will not be told about our resolver, so the setup page \
+               will not open by itself: {e}");
+    }
 
     println!();
     println!("=== BentoProxy node setup ===");
@@ -168,6 +172,9 @@ fn serve(
     // and holding the request body at once.
     let mut server = EspHttpServer::new(&HttpConfig {
         stack_size: 10240,
+        // For the catch-all below. Handlers are matched in registration
+        // order, so the exact paths above it still win.
+        uri_match_wildcard: true,
         ..HttpConfig::default()
     })?;
 
@@ -216,7 +223,8 @@ fn serve(
     })?;
 
     // Phones probe these URLs to decide whether a network is "captive"; a
-    // redirect is what makes the setup page open by itself.
+    // redirect is what makes the setup page open by itself. `no-store`
+    // matters: iOS reuses a cached probe result and would skip the check.
     for probe in [
         "/generate_204",               // Android
         "/gen_204",                    // Android, older
@@ -227,10 +235,14 @@ fn serve(
         "/canonical.html",             // Firefox
     ] {
         server.fn_handler(probe, Method::Get, move |req| {
-            req.into_response(302, None, &[("Location", "http://192.168.71.1/")])?;
-            Ok::<(), anyhow::Error>(())
+            redirect_to_portal(req)
         })?;
     }
+
+    // Anything else, because probe paths change between OS versions and our
+    // own 404 would read as a working internet connection. Registered last
+    // so the real pages keep their handlers.
+    server.fn_handler("/*", Method::Get, move |req| redirect_to_portal(req))?;
 
     Ok(server)
 }
@@ -304,6 +316,65 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Send a probe to the setup page, uncached.
+fn redirect_to_portal(req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection>) -> Result<()> {
+    req.into_response(
+        302,
+        None,
+        &[
+            ("Location", &format!("http://{PORTAL_IP}/")),
+            ("Cache-Control", "no-store"),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Hand this node out as the DHCP DNS server.
+///
+/// The resolver below is useless until clients are told to use it: IDF's
+/// softAP offers a gateway but no DNS server, so a joining phone has nowhere
+/// to send its captive-portal check (`captive.apple.com` for iOS) and the
+/// setup page never opens by itself. The DHCP server only picks the setting
+/// up while it is stopped, so it is restarted around the change.
+fn advertise_dns(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
+    /// dhcpserver.h's OFFER_DNS, which the bindings do not expose.
+    const OFFER_DNS: u8 = 0x02;
+
+    let netif = esp_idf_svc::handle::RawHandle::handle(wifi.wifi().ap_netif());
+    if netif.is_null() {
+        return Err(anyhow!("the AP has no network interface"));
+    }
+
+    unsafe {
+        // Not an error if it was never started.
+        esp_idf_sys::esp_netif_dhcps_stop(netif);
+
+        let mut offer = OFFER_DNS;
+        esp_idf_sys::esp!(esp_idf_sys::esp_netif_dhcps_option(
+            netif,
+            esp_idf_sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
+            esp_idf_sys::esp_netif_dhcp_option_id_t_ESP_NETIF_DOMAIN_NAME_SERVER,
+            &mut offer as *mut u8 as *mut core::ffi::c_void,
+            core::mem::size_of_val(&offer) as u32,
+        ))?;
+
+        let mut dns: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
+        dns.ip.type_ = esp_idf_sys::ESP_IPADDR_TYPE_V4 as u8;
+        // esp_ip4_addr holds the first octet in the low byte.
+        dns.ip.u_addr.ip4.addr = u32::from_le_bytes(PORTAL_IP.octets());
+        esp_idf_sys::esp!(esp_idf_sys::esp_netif_set_dns_info(
+            netif,
+            esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+            &mut dns,
+        ))?;
+
+        esp_idf_sys::esp!(esp_idf_sys::esp_netif_dhcps_start(netif))?;
+    }
+
+    info!("DHCP now points clients at {PORTAL_IP} for DNS");
+    Ok(())
+}
+
 /// Answer every DNS query with the portal's address.
 ///
 /// Without this a phone's captive-portal check cannot resolve anything, so no
@@ -356,13 +427,24 @@ fn dns_reply(query: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Phones ask for AAAA alongside A. Answering those with an A record
+    // leaves iOS waiting on a reply it cannot use; an empty NOERROR makes it
+    // fall back to IPv4 at once.
+    let qtype = u16::from_be_bytes([query[pos + 1], query[pos + 2]]);
+    const TYPE_A: u16 = 1;
+    let answers: u16 = if qtype == TYPE_A { 1 } else { 0 };
+
     let mut reply = Vec::with_capacity(question_end + 16);
     reply.extend_from_slice(&query[0..2]); // transaction id
     reply.extend_from_slice(&[0x81, 0x80]); // response, recursion available
     reply.extend_from_slice(&[0x00, 0x01]); // one question
-    reply.extend_from_slice(&[0x00, 0x01]); // one answer
+    reply.extend_from_slice(&answers.to_be_bytes());
     reply.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no authority or additional
     reply.extend_from_slice(&query[12..question_end]);
+
+    if answers == 0 {
+        return Some(reply);
+    }
 
     reply.extend_from_slice(&[0xC0, 0x0C]); // pointer to the question's name
     reply.extend_from_slice(&[0x00, 0x01]); // type A

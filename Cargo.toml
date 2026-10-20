@@ -34,6 +34,10 @@ wdt-selftest = []
 # Crash before reaching the orchestrator, to prove a bad release is rolled
 # back and not retried. Test releases only.
 ota-crash-test = []
+# Opens the setup portal at boot, keeping stored settings, to check the
+# captive portal on a real phone. The portal times out and the node returns
+# to its network by itself.
+portal-test = []
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

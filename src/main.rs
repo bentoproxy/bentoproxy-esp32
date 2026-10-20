@@ -122,6 +122,9 @@ fn main() -> ! {
     // resale or a changed router.
     watch_reset_button(peripherals.pins.gpio0, nvs.clone());
 
+    #[cfg(feature = "portal-test")]
+    let _ = Settings::request_portal(nvs.clone());
+
     // The last boot could not join its saved network: offer setup for a while
     // so the owner can choose a new one, keeping the node's claim.
     if Settings::take_portal_request(nvs.clone()).unwrap_or(false) {
