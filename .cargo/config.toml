@@ -5,11 +5,18 @@ target = "xtensa-esp32s3-espidf"
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 
+# ESP32-C5, built by tools/build-c5.sh.
+[target.riscv32imac-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
 [env]
-ESP_IDF_VERSION = { value = "v5.3" }
+# 5.5 for both chips: production ESP32-C5 silicon needs it, and the
+# esp-idf-svc 0.53 / esp-idf-hal 0.47 crates no longer build against 5.3.
+ESP_IDF_VERSION = { value = "v5.5.1" }
 # Set these environment variables or put them in .env
 # ORCHESTRATOR_URL = "wss://bentoproxy.com:8443/ws/device"
 # DEVICE_ID = "esp32-dev-001"

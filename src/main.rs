@@ -15,6 +15,7 @@ mod ota;
 mod profile;
 mod provisioning;
 mod settings;
+mod status_led;
 mod tls;
 mod wait;
 mod ws;
@@ -28,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
-use esp_idf_hal::gpio::{Output, PinDriver};
-use esp_idf_hal::prelude::Peripherals;
+use esp_idf_hal::gpio::{AnyIOPin, PinDriver, Pull};
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     nvs::EspDefaultNvsPartition,
@@ -106,7 +107,6 @@ const INBOUND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Whether this boot has confirmed its image yet (see ota::confirm_running).
 static IMAGE_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-type Led = PinDriver<'static, esp_idf_hal::gpio::Gpio2, Output>;
 
 fn main() -> ! {
     esp_idf_sys::link_patches();
@@ -120,7 +120,26 @@ fn main() -> ! {
 
     // Holding BOOT for 10s while running returns the node to setup, for
     // resale or a changed router.
-    watch_reset_button(peripherals.pins.gpio0, nvs.clone());
+    // BOOT is GPIO0 on the S3 and GPIO28 on any C5 (its download strap).
+    #[cfg(not(esp32c5))]
+    let boot_button = peripherals.pins.gpio0.degrade_input_output();
+    #[cfg(esp32c5)]
+    let boot_button = peripherals.pins.gpio28.degrade_input_output();
+    watch_reset_button(boot_button, nvs.clone());
+
+    // Started first, so every state from here on shows (see status_led).
+    #[cfg(not(esp32c5))]
+    let led = status_led::Led {
+        pin: PinDriver::output(peripherals.pins.gpio2).unwrap(),
+        lit_when_high: true,
+    };
+    // The XIAO ESP32-C5's yellow user LED lights when its pin is low.
+    #[cfg(esp32c5)]
+    let led = status_led::Led {
+        pin: PinDriver::output(peripherals.pins.gpio27).unwrap(),
+        lit_when_high: false,
+    };
+    status_led::start(led);
 
     #[cfg(feature = "portal-test")]
     let _ = Settings::request_portal(nvs.clone());
@@ -133,6 +152,7 @@ fn main() -> ! {
             .flatten()
             .map(|s| s.wifi_ssid);
         info!("saved WiFi was unreachable; opening setup for {}s", PORTAL_TIMEOUT.as_secs());
+        status_led::set(status_led::State::Setup);
         match provisioning::run(peripherals.modem, sys_loop, nvs, Some(PORTAL_TIMEOUT), unreachable) {
             Ok(()) => restart("setup window closed"),
             Err(e) => restart(&format!("setup portal failed: {e:?}")),
@@ -145,6 +165,7 @@ fn main() -> ! {
         Ok(Some(settings)) => settings,
         Ok(None) => {
             info!("no settings stored; starting setup portal");
+            status_led::set(status_led::State::Setup);
             match provisioning::run(peripherals.modem, sys_loop, nvs, None, None) {
                 // Reboot so the normal path starts from a clean radio state
                 // rather than switching the interface out from under lwIP.
@@ -158,6 +179,7 @@ fn main() -> ! {
     let nvs_for_claim = nvs.clone();
     let nvs_for_portal = nvs.clone();
     let nvs_for_ota = nvs.clone();
+    status_led::set(status_led::State::Connecting);
     let (mut wifi, network_visible) = match init_wifi(peripherals.modem, sys_loop.clone(), nvs, &settings) {
         Ok(result) => result,
         Err(e) => restart(&format!("WiFi init failed: {e:?}")),
@@ -201,8 +223,6 @@ fn main() -> ! {
     check_for_update(&api_base, nvs_for_ota.clone());
     let mut last_update_check = Instant::now();
 
-    let mut led = PinDriver::output(peripherals.pins.gpio2).unwrap();
-    led.set_low().ok();
 
     // Two different wedges have left nodes connected but dead until someone
     // power-cycled them. Whatever the next one is, the watchdog turns it into
@@ -222,13 +242,13 @@ fn main() -> ! {
 
     loop {
         info!("Connecting to orchestrator: {}", settings.orchestrator_url);
+        status_led::set(status_led::State::Connecting);
 
         let session_deadline = last_update_check + UPDATE_CHECK_INTERVAL;
         match run_session(
             &settings,
             &credentials,
             &connector,
-            &mut led,
             &mut watchdog,
             session_deadline,
             nvs_for_ota.clone(),
@@ -236,8 +256,6 @@ fn main() -> ! {
             Ok(()) => info!("Orchestrator connection closed"),
             Err(e) => error!("Session ended: {e:?}"),
         }
-
-        led.set_low().ok();
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
             check_for_update(&api_base, nvs_for_ota.clone());
@@ -254,11 +272,13 @@ fn main() -> ! {
 /// Not at power-on: BOOT is the chip's strapping pin, and holding it while
 /// powering up starts the ROM's flashing mode instead of this firmware. Ten
 /// seconds is long enough that a brush against the button wipes nothing.
-fn watch_reset_button(pin: esp_idf_hal::gpio::Gpio0, nvs: EspDefaultNvsPartition) {
+fn watch_reset_button(pin: AnyIOPin<'static>, nvs: EspDefaultNvsPartition) {
     const HOLD: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(100);
 
-    let Ok(button) = esp_idf_hal::gpio::PinDriver::input(pin) else {
+    // Pulled up so an unpressed button reads high on boards without their
+    // own pull-up resistor.
+    let Ok(button) = PinDriver::input(pin, Pull::Up) else {
         warn!("BOOT button unavailable; factory reset disabled");
         return;
     };
@@ -318,7 +338,7 @@ fn restart(reason: &str) -> ! {
 }
 
 fn init_wifi(
-    modem: impl esp_idf_hal::peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
+    modem: impl esp_idf_hal::modem::WifiModemPeripheral + 'static,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     settings: &Settings,
@@ -421,22 +441,45 @@ fn obtain_credentials(settings: &Settings, nvs: NvsPartition) -> Result<(String,
     let setup_code = Settings::setup_code(nvs.clone())?;
     let api_base = claim::api_base_from_ws_url(&settings.orchestrator_url)?;
 
+    status_led::set(status_led::State::AwaitingClaim);
     let issued = claim::wait_for_claim(&api_base, &hw_id, &setup_code)?;
+    status_led::set(status_led::State::Connecting);
     Settings::save_credentials(nvs, &issued.device_id, &issued.device_token)?;
 
     Ok((issued.device_id, issued.device_token))
 }
 
+/// The channel width configured for the band the node is on.
+#[cfg(not(esp32c5))]
+fn configured_bandwidth(_channel: u8) -> esp_idf_sys::wifi_bandwidth_t {
+    let mut bandwidth: esp_idf_sys::wifi_bandwidth_t = 0;
+    unsafe {
+        esp_idf_sys::esp_wifi_get_bandwidth(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut bandwidth);
+    }
+    bandwidth
+}
+
+/// The channel width configured for the band the node is on. Dual-band chips
+/// keep one per band and refuse the single-band query.
+#[cfg(esp32c5)]
+fn configured_bandwidth(channel: u8) -> esp_idf_sys::wifi_bandwidth_t {
+    let mut bandwidths: esp_idf_sys::wifi_bandwidths_t = Default::default();
+    unsafe {
+        esp_idf_sys::esp_wifi_get_bandwidths(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut bandwidths);
+    }
+    // 2.4GHz channels are 1-14; anything above is 5GHz.
+    if channel > 14 { bandwidths.ghz_5g } else { bandwidths.ghz_2g }
+}
+
 /// Log the channel width and signal the router actually granted.
 fn log_link_quality() {
     let mut ap: esp_idf_sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-    let mut bandwidth: esp_idf_sys::wifi_bandwidth_t = 0;
     unsafe {
         if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) != esp_idf_sys::ESP_OK {
             return;
         }
-        esp_idf_sys::esp_wifi_get_bandwidth(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut bandwidth);
     }
+    let bandwidth = configured_bandwidth(ap.primary);
 
     let width = if bandwidth == esp_idf_sys::wifi_bandwidth_t_WIFI_BW_HT40 { "40MHz" } else { "20MHz" };
     let secondary = match ap.second {
@@ -455,7 +498,6 @@ fn run_session(
     settings: &Settings,
     credentials: &(String, String),
     connector: &Connector,
-    led: &mut Led,
     watchdog: &mut TWDTDriver<'_>,
     deadline: Instant,
     nvs: NvsPartition,
@@ -488,6 +530,7 @@ fn run_session(
         return Err(anyhow!("authentication rejected by orchestrator"));
     }
     info!("Authenticated");
+    status_led::set(status_led::State::Online);
 
     // Reaching the orchestrator is what proves a new image: confirm it, or
     // the bootloader would roll back to the previous one on the next reset.
@@ -587,7 +630,9 @@ fn run_session(
             last_report = Instant::now();
         }
 
-        set_activity_led(led, !streams.is_empty());
+        if moved > 0 {
+            status_led::activity();
+        }
 
         // Idle pass: wait for any socket to become readable rather than
         // sleeping a fixed interval. Busy passes loop straight back.
@@ -781,9 +826,6 @@ fn relay_to_orchestrator<S: Read + Write>(
     Ok(total)
 }
 
-fn set_activity_led(led: &mut Led, active: bool) {
-    let _ = if active { led.set_high() } else { led.set_low() };
-}
 
 fn write_all_nonblocking<W: Write>(stream: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
     while !buf.is_empty() {

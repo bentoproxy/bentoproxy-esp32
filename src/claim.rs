@@ -17,7 +17,12 @@ use esp_idf_svc::io::Write;
 use log::{info, warn};
 
 /// Model string shown in the dashboard beside a waiting node.
-const MODEL: &str = "esp32s3";
+/// Which chip this build is for. Also selects the update channel, since an
+/// image only runs on the chip it was built for.
+#[cfg(esp32c5)]
+pub(crate) const MODEL: &str = "esp32c5";
+#[cfg(not(esp32c5))]
+pub(crate) const MODEL: &str = "esp32s3";
 /// Wait between polls. The owner has to reach their dashboard, so there is no
 /// point hammering the server.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);

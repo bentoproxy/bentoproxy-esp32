@@ -3,6 +3,9 @@
 #
 #   tools/release-firmware.sh [version]
 #
+# Each chip has its own channel, firmware/<chip>/, because an image only runs
+# on the chip it was built for. BENTO_FW_CHIP picks the chip (esp32s3).
+#
 # The version defaults to the UTC time (YYYYMMDDHHMM), which only ever grows,
 # so every release supersedes the last. Nodes check at boot and every 12h.
 #
@@ -12,6 +15,7 @@
 #   BENTO_SSH_PORT       ssh port      (2222)
 #   BENTO_FIRMWARE_DIR   remote dir    (/opt/apps/bentoproxy/firmware)
 #   BENTO_FW_FEATURES    cargo features for test releases (none)
+#   BENTO_FW_CHIP        esp32s3 or esp32c5 (esp32s3)
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,6 +25,13 @@ PORT=${BENTO_SSH_PORT:-2222}
 REMOTE_DIR=${BENTO_FIRMWARE_DIR:-/opt/apps/bentoproxy/firmware}
 VERSION=${1:-$(date -u +%Y%m%d%H%M)}
 FEATURES=${BENTO_FW_FEATURES:-}
+CHIP=${BENTO_FW_CHIP:-esp32s3}
+
+case "$CHIP" in
+    esp32s3) ELF=target/xtensa-esp32s3-espidf/release/bentoproxy-esp32; FLASH=16mb ;;
+    esp32c5) ELF=target-c5/riscv32imac-esp-espidf/release/bentoproxy-esp32; FLASH=8mb ;;
+    *) echo "unknown chip: $CHIP" >&2; exit 1 ;;
+esac
 
 [ -f "$KEY" ] || { echo "signing key not found: $KEY" >&2; exit 1; }
 [[ "$VERSION" =~ ^[0-9]+$ ]] || { echo "version must be an integer: $VERSION" >&2; exit 1; }
@@ -33,15 +44,18 @@ source ~/export-esp.sh
 # node gets those from setup and claiming.
 unset ORCHESTRATOR_URL DEVICE_ID DEVICE_TOKEN WIFI_SSID WIFI_PASSWORD
 
-echo "==> building firmware $VERSION"
-BENTO_FW_VERSION=$VERSION cargo build --release ${FEATURES:+--features "$FEATURES"}
+echo "==> building $CHIP firmware $VERSION"
+if [ "$CHIP" = esp32c5 ]; then
+    BENTO_FW_VERSION=$VERSION tools/build-c5.sh ${FEATURES:+--features "$FEATURES"}
+else
+    BENTO_FW_VERSION=$VERSION cargo build --release ${FEATURES:+--features "$FEATURES"}
+fi
 
-ELF=target/xtensa-esp32s3-espidf/release/bentoproxy-esp32
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
 # An app image, not a merged flash image: OTA replaces only the app slot.
-espflash save-image --chip esp32s3 --flash-mode dio --flash-size 16mb "$ELF" "$OUT/app.bin" >/dev/null
+espflash save-image --chip "$CHIP" --flash-mode dio --flash-size "$FLASH" "$ELF" "$OUT/app.bin" >/dev/null
 
 # Content-addressed name. Cloudflare caches .bin files for hours, so a name
 # must never be reused for different bytes: a re-published release would be
@@ -57,12 +71,22 @@ echo "==> signing ($SIZE bytes)"
 (cd / && cargo +stable build --quiet --release --manifest-path "$REPO/tools/fwsign/Cargo.toml")
 "$REPO/tools/fwsign/target/release/fwsign" sign "$KEY" "$OUT/$IMAGE" "$VERSION" "$IMAGE" > "$OUT/manifest.json"
 
-echo "==> publishing to $SERVER:$REMOTE_DIR"
-# Image first, manifest last, and the manifest swapped in atomically: a node
-# must never see a manifest whose image is not fully there yet.
-scp -q -P "$PORT" "$OUT/$IMAGE" "$SERVER:$REMOTE_DIR/$IMAGE"
-scp -q -P "$PORT" "$OUT/manifest.json" "$SERVER:$REMOTE_DIR/manifest.json.tmp"
-ssh -p "$PORT" "$SERVER" "mv $REMOTE_DIR/manifest.json.tmp $REMOTE_DIR/manifest.json"
+publish() { # remote directory
+    echo "==> publishing to $SERVER:$1"
+    ssh -p "$PORT" "$SERVER" "mkdir -p $1"
+    # Image first, manifest last, and the manifest swapped in atomically: a
+    # node must never see a manifest whose image is not fully there yet.
+    scp -q -P "$PORT" "$OUT/$IMAGE" "$SERVER:$1/$IMAGE"
+    scp -q -P "$PORT" "$OUT/manifest.json" "$SERVER:$1/manifest.json.tmp"
+    ssh -p "$PORT" "$SERVER" "mv $1/manifest.json.tmp $1/manifest.json"
+}
+
+publish "$REMOTE_DIR/$CHIP"
+# S3 firmware from before per-chip channels reads the top-level manifest;
+# keep it current so those nodes still reach the release that moves them.
+if [ "$CHIP" = esp32s3 ]; then
+    publish "$REMOTE_DIR"
+fi
 
 echo "==> released $VERSION"
 cat "$OUT/manifest.json"; echo

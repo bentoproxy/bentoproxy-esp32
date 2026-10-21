@@ -28,3 +28,4 @@ Thumbs.db
 # Host tools build for the host, not the board.
 tools/fwsign/target
 /target-secure
+/target-c5

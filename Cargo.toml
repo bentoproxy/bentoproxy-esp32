@@ -8,9 +8,9 @@ description = "BentoProxy ESP32 node firmware"
 
 [dependencies]
 # ESP32 HAL and runtime - using 0.51 with ESP-IDF v5.3
-esp-idf-svc = { version = "0.51", default-features = false, features = ["binstart", "std"] }
-esp-idf-hal = "0.45"
-esp-idf-sys = { version = "0.36", features = ["binstart"] }
+esp-idf-svc = { version = "0.53", default-features = false, features = ["binstart", "std"] }
+esp-idf-hal = "0.47"
+esp-idf-sys = { version = "0.38", features = ["binstart"] }
 
 # Protocol
 bentoproxy-protocol = { path = "../bentoproxy-protocol" }
@@ -18,7 +18,7 @@ bentoproxy-protocol = { path = "../bentoproxy-protocol" }
 # Utilities
 log = "0.4"
 anyhow = "1.0"
-embedded-svc = "0.28"
+embedded-svc = "0.29"
 
 # Firmware update verification: SHA-256 of the image, Ed25519 signature.
 sha2 = { version = "0.10", default-features = false }

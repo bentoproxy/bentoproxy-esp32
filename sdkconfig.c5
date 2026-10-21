@@ -1,0 +1,8 @@
+# ESP32-C5 overlay on sdkconfig.defaults, applied by tools/build-c5.sh.
+#
+# The C5 dev board has 8MB of flash; the two 3MB app slots still fit.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# Single core: the S3's split of WiFi and lwIP across two cores does not
+# apply, so both tasks stay on the one core.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY=y
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y

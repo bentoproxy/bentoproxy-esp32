@@ -39,7 +39,7 @@ const MAX_BODY: usize = 1024;
 /// old network: a router reboot must not strand a node in setup mode, while a
 /// node that really moved keeps offering setup on every cycle.
 pub fn run(
-    modem: impl esp_idf_hal::peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
+    modem: impl esp_idf_hal::modem::WifiModemPeripheral + 'static,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     timeout: Option<Duration>,

@@ -89,7 +89,10 @@ pub fn reconcile_after_boot(partition: EspDefaultNvsPartition) {
 /// Check the orchestrator for a newer release and install it if it verifies.
 pub fn check_and_install(api_base: &str, partition: EspDefaultNvsPartition) -> Result<Outcome> {
     let current = firmware_version();
-    let manifest_url = format!("{api_base}/api/device/firmware/manifest.json");
+    // One channel per chip: an image built for another chip would be
+    // refused by the bootloader, after a wasted download.
+    let channel = format!("{api_base}/api/device/firmware/{}", crate::claim::MODEL);
+    let manifest_url = format!("{channel}/manifest.json");
 
     let Some(body) = fetch_small(&manifest_url)? else {
         info!("ota: no release published");
@@ -120,7 +123,7 @@ pub fn check_and_install(api_base: &str, partition: EspDefaultNvsPartition) -> R
         manifest.size / 1024
     );
 
-    let image_url = format!("{api_base}/api/device/firmware/{}", manifest.image);
+    let image_url = format!("{channel}/{}", manifest.image);
     download_into_inactive_slot(&image_url, &manifest)?;
 
     // Recorded after the slot is switched and before rebooting into it.
