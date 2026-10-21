@@ -58,11 +58,20 @@ use ws::WsConn;
 /// Deliberately higher than the capacity the orchestrator routes against: the
 /// spare slots absorb bursts and leave room for an owner-triggered speed test,
 /// which a node saturated with relayed traffic would otherwise refuse.
+///
+/// The S3 is bounded by its RAM; the XIAO C5 has 8MB of PSRAM, so there the
+/// socket table is the limit (24 sockets, see sdkconfig.c5).
+#[cfg(not(esp32c5))]
 const MAX_CONCURRENT_STREAMS: usize = 12;
+#[cfg(esp32c5)]
+const MAX_CONCURRENT_STREAMS: usize = 20;
 /// Streams the orchestrator should route here at once, declared at auth.
 /// Below MAX_CONCURRENT_STREAMS on purpose: the spare slots absorb bursts and
 /// keep room for an owner-triggered speed test on a busy node.
+#[cfg(not(esp32c5))]
 const ROUTABLE_STREAMS: u16 = 8;
+#[cfg(esp32c5)]
+const ROUTABLE_STREAMS: u16 = 16;
 /// A relay loop that stops feeding the watchdog this long reboots the node.
 /// Well above the longest legitimate stall in the loop (the 20s write
 /// deadline), so it only fires on a real hang.
@@ -520,7 +529,7 @@ fn run_session(
         device_id,
         device_token,
         Capabilities {
-            max_streams: ROUTABLE_STREAMS,
+            max_streams: if cfg!(feature = "bench-isolate") { 1 } else { ROUTABLE_STREAMS },
             kind: NodeKind::Microcontroller,
         },
     ))?;
@@ -621,10 +630,15 @@ fn run_session(
             info!("{}", profile::task_report());
             // Heap margin, so buffer tuning shows its cost before it shows a
             // crash. The minimum is the low-water mark since boot.
+            // Internal RAM shown apart: with PSRAM the totals stay huge
+            // while the RAM network buffers need can still run out.
+            let internal = esp_idf_sys::MALLOC_CAP_INTERNAL;
             info!(
-                "heap: {} KB free, {} KB at lowest",
+                "heap: {} KB free, {} KB at lowest; internal {} KB free, {} KB at lowest",
                 unsafe { esp_idf_sys::esp_get_free_heap_size() } / 1024,
-                unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() } / 1024
+                unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() } / 1024,
+                unsafe { esp_idf_sys::heap_caps_get_free_size(internal) } / 1024,
+                unsafe { esp_idf_sys::heap_caps_get_minimum_free_size(internal) } / 1024
             );
             reported_bytes = 0;
             last_report = Instant::now();

@@ -38,6 +38,9 @@ ota-crash-test = []
 # captive portal on a real phone. The portal times out and the node returns
 # to its network by itself.
 portal-test = []
+# Announce a capacity of 1, so the orchestrator routes live traffic elsewhere
+# and a speed test measures the node alone. Tuning builds only.
+bench-isolate = []
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

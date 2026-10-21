@@ -1,8 +1,65 @@
 # ESP32-C5 overlay on sdkconfig.defaults, applied by tools/build-c5.sh.
+# Tuned on a Seeed XIAO ESP32-C5 (8MB flash, 8MB PSRAM) on 5GHz WiFi 6.
 #
-# The C5 dev board has 8MB of flash; the two 3MB app slots still fit.
+# Measured with 8 parallel 2MB transfers, isolated from live traffic:
+#   S3 settings as they were, no PSRAM     24 KB/s (heap down to 3KB, stalls)
+#   + PSRAM, 40MHz                        572
+#   + PSRAM at 80MHz                      674
+#   + WiFi/lwIP buffers internal          778  (internal heap down to 8KB)
+#   + -O2 / Rust opt-level 3              826
+#   + 32KB window, buffers in PSRAM       740  single stream 263 -> 702
+#   + ChaCha20-Poly1305                   782
+#   + block-ack windows 32                856  (internal heap low 43KB)
+# Tried and dropped: AES polling (no gain, more CPU), lwIP core locking (no
+# gain), 16KB TLS records (-6%, send stalls), QIO flash (watchdog boot loop,
+# as on the S3), 60KB window (burstier, worse), TX block-ack 64 (worse).
+# The ceiling is the single core: relaying, TLS, lwIP and WiFi share it.
+
+# 8MB of flash; the two 3MB app slots still fit.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
 # Single core: the S3's split of WiFi and lwIP across two cores does not
 # apply, so both tasks stay on the one core.
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY=y
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+
+# PSRAM. Without it, 8 parallel streams ran the 384KB internal heap down to
+# 3KB and every transfer stalled. WiFi and lwIP buffers go to PSRAM, and so
+# does any allocation above 4KB, keeping internal RAM for what has to be
+# internal (TLS state stays internal: MBEDTLS_INTERNAL_MEM_ALLOC, the
+# default, which this chip revision also needs because it cannot encrypt
+# PSRAM). A C5 board without PSRAM still boots, on internal RAM only.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# 80MHz rather than the 40MHz default: the network buffers live there.
+CONFIG_SPIRAM_SPEED_80M=y
+
+# PSRAM lifts the memory limit on streams, leaving lwIP's socket table:
+# 20 relayed streams, the orchestrator link and DNS. Sockets are numbered
+# from FD_SETSIZE minus this, so they still fit select()'s set.
+CONFIG_LWIP_MAX_SOCKETS=24
+
+# A single stream moves one window per round trip: 5760 bytes (the S3's
+# internal-RAM budget) held it to ~265 KB/s. 32KB lives in PSRAM.
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
+# Optimise ESP-IDF (lwIP, WiFi glue, mbedTLS) for speed, not size: the core
+# is CPU-bound and the 3MB slot has room (tools/build-c5.sh does the same
+# for the Rust code). The image is ~2.6MB; watch it as features grow.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ChaCha20-Poly1305 for the orchestrator link, offered first in tls.rs: fast
+# in software, and the C5 has no GCM hardware, so AES-GCM's GHASH half runs
+# in software anyway.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+
+# WiFi 6 aggregation. RX may be at most twice the 16 static (internal) RX
+# buffers; the dynamic ones backing it are in PSRAM.
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32

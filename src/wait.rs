@@ -9,10 +9,10 @@
 
 use std::time::Duration;
 
-/// Descriptor-set capacity. lwIP numbers sockets from LWIP_SOCKET_OFFSET (48)
-/// and FD_SETSIZE is 64, so this covers 16 sockets — exactly
-/// CONFIG_LWIP_MAX_SOCKETS. Raising that setting past 16 would put
-/// descriptors outside the set; `add` refuses them rather than corrupt memory.
+/// Descriptor-set capacity. lwIP numbers its sockets from
+/// FD_SETSIZE - CONFIG_LWIP_MAX_SOCKETS up to FD_SETSIZE - 1, so they always
+/// fall inside the set (16 sockets on the S3, 24 on the C5). `add` refuses
+/// anything outside rather than corrupt memory.
 const FD_LIMIT: i32 = esp_idf_sys::FD_SETSIZE as i32;
 
 /// A set of descriptors to wait on.

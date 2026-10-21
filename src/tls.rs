@@ -5,8 +5,39 @@ use std::io::{Read, Write};
 use anyhow::{anyhow, Result};
 use log::info;
 
+/// Cipher suites the C5 offers, best first, zero-terminated for mbedTLS.
+///
+/// ChaCha20-Poly1305 runs in plain software and is fast on a 32-bit core.
+/// AES-GCM uses the AES engine, but the C5 has no GCM hardware, so its GHASH
+/// half runs in software and each record pays the DMA setup: encryption was
+/// the C5's throughput ceiling. AES-GCM stays as the fallback.
+#[cfg(esp32c5)]
+static CIPHERSUITES: [i32; 7] = [
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 as i32,
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 as i32,
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 as i32,
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 as i32,
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 as i32,
+    esp_idf_sys::MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 as i32,
+    0,
+];
+
 pub struct TlsStream {
     handle: *mut esp_idf_sys::esp_tls,
+}
+
+/// Which cipher suite the handshake settled on: it decides encryption cost.
+fn log_ciphersuite(handle: *mut esp_idf_sys::esp_tls) {
+    unsafe {
+        let ssl = esp_idf_sys::esp_tls_get_ssl_context(handle) as *const esp_idf_sys::mbedtls_ssl_context;
+        if ssl.is_null() {
+            return;
+        }
+        let name = esp_idf_sys::mbedtls_ssl_get_ciphersuite(ssl);
+        if !name.is_null() {
+            info!("TLS cipher suite: {}", std::ffi::CStr::from_ptr(name).to_string_lossy());
+        }
+    }
 }
 
 impl TlsStream {
@@ -15,6 +46,10 @@ impl TlsStream {
         let mut config: esp_idf_sys::esp_tls_cfg_t = unsafe { std::mem::zeroed() };
         config.crt_bundle_attach = Some(esp_idf_sys::esp_crt_bundle_attach);
         config.timeout_ms = timeout_ms as i32;
+        #[cfg(esp32c5)]
+        {
+            config.ciphersuites_list = CIPHERSUITES.as_ptr();
+        }
 
         let host_cstr = std::ffi::CString::new(host)?;
         let handle = unsafe { esp_idf_sys::esp_tls_init() };
@@ -38,6 +73,7 @@ impl TlsStream {
             return Err(anyhow!("TLS handshake with {host}:{port} failed"));
         }
 
+        log_ciphersuite(handle);
         Ok(Self { handle })
     }
 

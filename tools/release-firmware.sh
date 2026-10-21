@@ -55,7 +55,16 @@ OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
 # An app image, not a merged flash image: OTA replaces only the app slot.
-espflash save-image --chip "$CHIP" --flash-mode dio --flash-size "$FLASH" "$ELF" "$OUT/app.bin" >/dev/null
+if [ "$CHIP" = esp32c5 ]; then
+    # espflash stamps C5 images for pre-production silicon (rev 0.x), which
+    # rev 1.0 chips refuse; esptool takes the range ESP-IDF configured.
+    PY=$(ls "$REPO"/.embuild/espressif/python_env/*/bin/python | head -1)
+    "$PY" -m esptool --chip esp32c5 elf2image --flash_mode dio --flash_size 8MB \
+        --min-rev-full 100 --max-rev-full 199 --elf-sha256-offset 0xb0 \
+        -o "$OUT/app.bin" "$ELF" >/dev/null
+else
+    espflash save-image --chip "$CHIP" --flash-mode dio --flash-size "$FLASH" "$ELF" "$OUT/app.bin" >/dev/null
+fi
 
 # Content-addressed name. Cloudflare caches .bin files for hours, so a name
 # must never be reused for different bytes: a re-published release would be

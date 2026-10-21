@@ -15,5 +15,8 @@ cd "$REPO"
 export MCU=esp32c5
 export ESP_IDF_SDKCONFIG_DEFAULTS="$REPO/sdkconfig.defaults;$REPO/sdkconfig.c5"
 export CARGO_TARGET_DIR="$REPO/target-c5"
+# The C5 has one core and runs out of CPU before memory: optimise the Rust
+# code for speed rather than the size the S3 build uses.
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=${CARGO_PROFILE_RELEASE_OPT_LEVEL:-3}
 
 cargo +nightly build --release --target riscv32imac-esp-espidf "$@"
