@@ -1,0 +1,6 @@
+# Used by `espflash flash` and `cargo run`. Without it espflash writes its
+# own default partition table: one big factory app and no OTA slots, so the
+# node can never take an over-the-air update (esp_ota_begin fails with
+# ESP_ERR_INVALID_ARG). Seen on the S3 on 2026-10-22.
+[idf_format_args]
+partition_table = "partitions.csv"
